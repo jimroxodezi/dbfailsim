@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dbfailsim</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>dbfailsim <span class="tag">chaos for data</span></h1>
+    <div class="header-actions">
+      <button id="heal-all" class="btn btn-heal">Heal all</button>
+      <span id="conn-dot" class="dot"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="nodes-panel">
+      <h2>Nodes</h2>
+      <div id="nodes" class="nodes-grid"></div>
+    </section>
+
+    <section class="panel" id="scenarios-panel">
+      <h2>Scenarios</h2>
+      <div id="scenarios" class="scenario-list"></div>
+    </section>
+
+    <section class="panel" id="check-panel">
+      <h2>Consistency check</h2>
+      <p class="hint">Runs the same query against every node directly (bypassing the proxy) and shows where they disagree.</p>
+      <div class="check-input-row">
+        <input id="check-query" type="text" placeholder="SELECT balance FROM accounts WHERE id=1" />
+        <button id="check-run" class="btn btn-primary">Run check</button>
+      </div>
+      <div id="check-results"></div>
+    </section>
+
+    <section class="panel" id="log-panel">
+      <h2>Activity</h2>
+      <div id="log"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

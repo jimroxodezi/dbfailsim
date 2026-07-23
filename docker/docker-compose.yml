@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  postgres-primary:
+    image: postgres:16
+    container_name: dbfailsim-primary
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: appdb
+      REPLICATION_PASSWORD: replpass
+    volumes:
+      - ./postgres/primary-init.sh:/docker-entrypoint-initdb.d/primary-init.sh:ro
+      - primary-data:/var/lib/postgresql/data
+    ports:
+      # Host port 15432 to avoid colliding with a locally running Postgres;
+      # in-network traffic (replica, dbfailsim) still uses 5432.
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-replica:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile.replica
+    container_name: dbfailsim-replica
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: postgres-primary
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replpass
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    volumes:
+      - replica-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  dbfailsim:
+    build:
+      context: ..
+      dockerfile: docker/dbfailsim/Dockerfile
+    container_name: dbfailsim
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+    volumes:
+      - ./config.docker.json:/app/config.json:ro
+    ports:
+      - "6432:6432" # proxy in front of the primary - point your app here
+      - "6433:6433" # proxy in front of the replica
+      - "8080:8080" # web dashboard: http://localhost:8080
+    command: ["serve", "--config", "/app/config.json"]
+
+volumes:
+  primary-data:
+  replica-data:
