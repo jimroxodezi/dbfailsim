@@ -21,7 +21,7 @@ import (
 	"github.com/jimroxodezi/dbfailsim/internal/scenario"
 )
 
-//go:embed static/*
+//go:embed static
 var staticFS embed.FS
 
 type Server struct {
