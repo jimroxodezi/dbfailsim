@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jimroxodezi/dbfailsim/internal/config"
 	"github.com/jimroxodezi/dbfailsim/internal/proxy"
@@ -24,7 +25,7 @@ func newTestHandler(t *testing.T) (http.Handler, map[string]*proxy.Proxy) {
 	proxies := map[string]*proxy.Proxy{
 		"n1": proxy.New("n1", "127.0.0.1:0", "127.0.0.1:1"),
 	}
-	eng := scenario.New(proxies)
+	eng := scenario.New(proxies, nil)
 	h, err := NewServer(cfg, proxies, eng).Handler()
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +42,7 @@ func newAuthedHandler(t *testing.T, token string) http.Handler {
 	proxies := map[string]*proxy.Proxy{
 		"n1": proxy.New("n1", "127.0.0.1:0", "127.0.0.1:1"),
 	}
-	h, err := NewServer(cfg, proxies, scenario.New(proxies)).Handler()
+	h, err := NewServer(cfg, proxies, scenario.New(proxies, nil)).Handler()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,5 +189,41 @@ func TestScenariosEndpoint(t *testing.T) {
 	}
 	if len(scenarios) != 1 || scenarios[0].Name != "crash-n1" {
 		t.Fatalf("unexpected scenarios: %+v", scenarios)
+	}
+}
+
+func TestFaultEndpointGeneralForm(t *testing.T) {
+	h, proxies := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	body := `{"kind":"reorder","params":{"buffer_size":4,"probability":0.5},"for_ms":150}`
+	resp, err := http.Post(srv.URL+"/nodes/n1/fault", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var st proxy.Status
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.ActiveFaults) != 1 || st.ActiveFaults[0] != "reorder" {
+		t.Fatalf("active_faults = %v", st.ActiveFaults)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if n := proxies["n1"].Registry.Names(); len(n) != 0 {
+		t.Fatalf("for_ms did not expire fault: %v", n)
+	}
+
+	resp2, err := http.Post(srv.URL+"/nodes/n1/fault", "application/json", strings.NewReader(`{"kind":"nope"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown kind status = %d", resp2.StatusCode)
 	}
 }

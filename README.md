@@ -84,10 +84,11 @@ Package layout:
 |---|---|
 | `cmd/dbfailsim` | CLI entry point; subcommands are HTTP clients of the control API |
 | `internal/proxy` | Protocol-agnostic TCP proxy; applies latency/drop per chunk, severs connections on partition/crash |
-| `internal/scenario` | Runs named, timed fault sequences against the live proxies |
-| `internal/control` | chi-routed HTTP API + embedded web dashboard |
+| `internal/faults` | The fault model: connection, dial, packet, node, topology, data, workload and consistency fault types |
+| `internal/scenario` | The single fault engine: turns a `config.FaultStep` into registry/state/docker actions; runs timed scenarios |
+| `internal/control` | chi-routed HTTP API + embedded web dashboard (routes faults through the same engine) |
 | `internal/check` | Cross-node consistency check via each node's `check_command` |
-| `internal/config` | JSON config: nodes, scenarios, control address |
+| `internal/config` | The single YAML schema: nodes (incl. `container_id`, `role`, `stream`), scenarios, control address |
 
 ## Quick start
 
@@ -98,35 +99,36 @@ See [TEST.md](TEST.md) for a full guide to testing against real databases
 go build -o dbfailsim ./cmd/dbfailsim
 go test ./...   # optional: run the test suite
 
-# Edit config.example.json: point listen_addr/upstream_addr at your real
+# Edit config.example.yaml: point listen_addr/upstream_addr at your real
 # DB nodes, and set check_command to a psql/mysql one-liner for each node.
-cp config.example.json config.json
+cp config.example.yaml config.yaml
 
 # Start the proxies + control API
-./dbfailsim serve --config config.json &
+./dbfailsim serve --config config.yaml &
 
 # Point your app / psql / your test suite at the *proxy* addresses
-# (listen_addr from config.json) instead of the real DB ports.
+# (listen_addr from config.yaml) instead of the real DB ports.
 
 # Run a named scenario
-./dbfailsim inject --config config.json --scenario replica-lag
+./dbfailsim inject --config config.yaml --scenario replica-lag
 
 # See current fault state on every node
-./dbfailsim status --config config.json
+./dbfailsim status --config config.yaml
 
 # See what each node's clients would actually observe right now
-./dbfailsim check --config config.json --query "SELECT balance FROM accounts WHERE id=1"
+./dbfailsim check --config config.yaml --query "SELECT balance FROM accounts WHERE id=1"
 
 # One-off fault instead of a full scenario
-./dbfailsim fault --config config.json --node replica-1 --kind latency --value 2000
+./dbfailsim fault --config config.yaml --node replica-1 --kind latency --value 2000
+./dbfailsim fault --config config.yaml --node replica-1 --kind reorder --params '{"buffer_size":5}' --for 5000
 
 # Recover
-./dbfailsim heal --config config.json
+./dbfailsim heal --config config.yaml
 ```
 
 ## Config format
 
-See `config.example.json`. Each node needs:
+See `config.example.yaml`. Each node needs:
 
 - `name` — used to refer to the node in scenarios and CLI flags
 - `listen_addr` — where dbfailsim's proxy listens (point your app here)
@@ -136,11 +138,35 @@ See `config.example.json`. Each node needs:
   "plug into your DB infra" without needing a driver for every database —
   it shells out to whatever client you already have installed (`psql`,
   `mysql`, `redis-cli`, etc.).
+- `container_id` (optional) — the docker container name/ID for this node.
+  Required for node-level faults (`node_crash`, `zombie`, `cpu_throttle`,
+  `oom`, `clock_skew`).
+- `role` (optional) — a free-form label (`primary`, `replica`, `voter`).
+- `stream` (optional) — `query` (default) or `replication`. Packet-level
+  faults (`replica_lag`, `wal_delay`, `wal_corruption`) only act on a
+  `replication` proxy.
 
-Scenarios are named sequences of fault steps (`latency`, `drop`,
-`partition`, `crash`, `heal`), each with an `after_ms` offset from when the
-scenario starts, so multi-stage failures (e.g. "lag for 3s, then fully
-partition") are reproducible with one command.
+Scenarios are named sequences of fault steps, each with an `after_ms`
+offset from when the scenario starts and an optional `for_ms` after which
+the engine removes the fault again. A step is either the **short form**
+(`latency` + `latency_ms`, `drop` + `drop_percent`, or the parameterless
+`partition` / `crash` / `heal`) or the **general form**: any kind the
+engine knows with kind-specific `params`:
+
+```yaml
+- node: replica-1
+  kind: latency
+  after_ms: 0
+  for_ms: 45000
+  params: {delay: 50ms, jitter: 20ms, ramp_to: 3s, ramp_over: 30s}
+```
+
+Kinds: `latency`, `drop`, `partition`, `crash`, `heal`, `bandwidth_throttle`,
+`bursty_loss`, `reorder`, `duplication`, `asymmetric_partition`, `tcp_rst`,
+`dns_failure`, `replica_lag`, `wal_delay`, `wal_corruption`,
+`query_corruption`, `stale_read`, `node_crash`, `clock_skew`,
+`cpu_throttle`, `oom`, `zombie`. Durations in `params` are strings
+(`500ms`) or milliseconds as numbers. `"node": "*"` targets every node.
 
 ## Control API and dashboard
 
@@ -151,7 +177,9 @@ built-in dashboard:
 - `GET  /status` — current fault state of every node
 - `GET  /scenarios` — the named scenarios defined in your config
 - `GET  /check?query=<query>` — run the consistency check and return JSON
-- `POST /nodes/{node}/fault` — apply one fault: `{"kind":"latency","latency_ms":2000}`
+- `POST /nodes/{node}/fault` — apply one fault, same shape as a scenario step
+  minus the node: `{"kind":"latency","latency_ms":2000}` or
+  `{"kind":"reorder","params":{"buffer_size":5},"for_ms":5000}`
 - `POST /scenarios/{name}/run` — run a named scenario from the config
 - `POST /heal` — clear all fault state
 

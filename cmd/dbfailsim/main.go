@@ -6,25 +6,29 @@
 //
 // Usage:
 //
-//	dbfailsim serve    --config config.json
-//	dbfailsim inject   --config config.json --scenario replica-lag
-//	dbfailsim fault    --config config.json --node replica-1 --kind latency --value 2000
-//	dbfailsim heal     --config config.json
-//	dbfailsim status   --config config.json
-//	dbfailsim check    --config config.json --query "SELECT balance FROM accounts WHERE id=1"
+//	dbfailsim serve    --config config.yaml
+//	dbfailsim inject   --config config.yaml --scenario replica-lag
+//	dbfailsim fault    --config config.yaml --node replica-1 --kind latency --value 2000
+//	dbfailsim fault    --config config.yaml --node replica-1 --kind reorder --params '{"buffer_size":5}' --for 5000
+//	dbfailsim heal     --config config.yaml
+//	dbfailsim status   --config config.yaml
+//	dbfailsim check    --config config.yaml --query "SELECT balance FROM accounts WHERE id=1"
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/jimroxodezi/dbfailsim/internal/check"
 	"github.com/jimroxodezi/dbfailsim/internal/config"
 	"github.com/jimroxodezi/dbfailsim/internal/control"
+	"github.com/jimroxodezi/dbfailsim/internal/faults"
 	"github.com/jimroxodezi/dbfailsim/internal/proxy"
 	"github.com/jimroxodezi/dbfailsim/internal/scenario"
 )
@@ -74,7 +78,7 @@ Run 'dbfailsim <command> -h' for command-specific flags.
 
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
@@ -83,6 +87,9 @@ func cmdServe(args []string) {
 	proxies := make(map[string]*proxy.Proxy)
 	for _, n := range cfg.Nodes {
 		p := proxy.New(n.Name, n.ListenAddr, n.UpstreamAddr)
+		if n.IsReplicationStream() {
+			p.Stream = faults.ReplicationStream
+		}
 		proxies[n.Name] = p
 		go func(p *proxy.Proxy) {
 			if err := p.Start(); err != nil {
@@ -91,14 +98,14 @@ func cmdServe(args []string) {
 		}(p)
 	}
 
-	eng := scenario.New(proxies)
+	eng := scenario.New(proxies, cfg)
 	srv := control.NewServer(cfg, proxies, eng)
 	must(srv.ListenAndServe(cfg.ControlAddr))
 }
 
 func cmdInject(args []string) {
 	fs := flag.NewFlagSet("inject", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	scenarioName := fs.String("scenario", "", "scenario name to run (must be defined in config, or use a built-in: replica-lag, split-brain, node-crash)")
 	fs.Parse(args)
 
@@ -114,25 +121,37 @@ func cmdInject(args []string) {
 
 func cmdFault(args []string) {
 	fs := flag.NewFlagSet("fault", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	node := fs.String("node", "", "node name")
-	kind := fs.String("kind", "", "latency | drop | partition | crash | heal")
+	kind := fs.String("kind", "", "fault kind: "+strings.Join(scenario.Kinds(), " | "))
 	value := fs.Int("value", 0, "latency_ms for kind=latency, drop_percent for kind=drop")
+	params := fs.String("params", "", `kind-specific JSON params, e.g. '{"delay":"500ms","ramp_to":"3s"}'`)
+	forMs := fs.Int("for", 0, "auto-remove the fault after this many milliseconds (0 = until healed)")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
 	must(err)
 
-	var body string
+	req := map[string]any{"kind": *kind}
 	switch *kind {
 	case "latency":
-		body = fmt.Sprintf(`{"kind":"latency","latency_ms":%d}`, *value)
+		req["latency_ms"] = *value
 	case "drop":
-		body = fmt.Sprintf(`{"kind":"drop","drop_percent":%d}`, *value)
-	default:
-		body = fmt.Sprintf(`{"kind":%q}`, *kind)
+		req["drop_percent"] = *value
 	}
-	resp, err := apiRequest(cfg, http.MethodPost, fmt.Sprintf("/nodes/%s/fault", url.PathEscape(*node)), stringsReader(body))
+	if *params != "" {
+		var p map[string]any
+		if err := json.Unmarshal([]byte(*params), &p); err != nil {
+			must(fmt.Errorf("--params: %w", err))
+		}
+		req["params"] = p
+	}
+	if *forMs > 0 {
+		req["for_ms"] = *forMs
+	}
+	bodyBytes, _ := json.Marshal(req)
+	body := string(bodyBytes)
+	resp, err := apiRequest(cfg, http.MethodPost, fmt.Sprintf("/nodes/%s/fault", url.PathEscape(*node)), strings.NewReader(body))
 	must(err)
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
@@ -141,7 +160,7 @@ func cmdFault(args []string) {
 
 func cmdHeal(args []string) {
 	fs := flag.NewFlagSet("heal", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
@@ -156,7 +175,7 @@ func cmdHeal(args []string) {
 
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
@@ -171,7 +190,7 @@ func cmdStatus(args []string) {
 
 func cmdCheck(args []string) {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
-	configPath := fs.String("config", "config.json", "path to config file")
+	configPath := fs.String("config", "config.yaml", "path to config file")
 	query := fs.String("query", "", "query text to run against every node's check_command")
 	fs.Parse(args)
 
@@ -207,22 +226,4 @@ func must(err error) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-}
-
-// stringsReader avoids importing strings just for this one conversion at
-// call sites above.
-func stringsReader(s string) *stringReader { return &stringReader{s: s} }
-
-type stringReader struct {
-	s string
-	i int
-}
-
-func (r *stringReader) Read(p []byte) (int, error) {
-	if r.i >= len(r.s) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.s[r.i:])
-	r.i += n
-	return n, nil
 }

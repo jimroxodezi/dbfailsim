@@ -1,7 +1,9 @@
 package scenario
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/jimroxodezi/dbfailsim/internal/config"
 	"github.com/jimroxodezi/dbfailsim/internal/proxy"
@@ -12,12 +14,12 @@ func testEngine() (*Engine, map[string]*proxy.Proxy) {
 		"primary":   proxy.New("primary", "127.0.0.1:0", "127.0.0.1:1"),
 		"replica-1": proxy.New("replica-1", "127.0.0.1:0", "127.0.0.1:1"),
 	}
-	return New(proxies), proxies
+	return New(proxies, nil), proxies
 }
 
 func TestRunAppliesSteps(t *testing.T) {
 	eng, proxies := testEngine()
-	err := eng.Run(&config.Scenario{
+	err := eng.Run(context.Background(), &config.Scenario{
 		Name: "test",
 		Steps: []config.FaultStep{
 			{Node: "primary", Kind: "latency", LatencyMs: 100, AfterMs: 0},
@@ -38,7 +40,7 @@ func TestRunAppliesSteps(t *testing.T) {
 
 func TestRunRejectsUnknownNode(t *testing.T) {
 	eng, _ := testEngine()
-	err := eng.Run(&config.Scenario{
+	err := eng.Run(context.Background(), &config.Scenario{
 		Name:  "bad",
 		Steps: []config.FaultStep{{Node: "ghost", Kind: "crash"}},
 	})
@@ -49,7 +51,7 @@ func TestRunRejectsUnknownNode(t *testing.T) {
 
 func TestRunRejectsUnknownKind(t *testing.T) {
 	eng, _ := testEngine()
-	err := eng.Run(&config.Scenario{
+	err := eng.Run(context.Background(), &config.Scenario{
 		Name:  "bad",
 		Steps: []config.FaultStep{{Node: "primary", Kind: "meteor"}},
 	})
@@ -63,7 +65,7 @@ func TestHealStepAndHealAll(t *testing.T) {
 	proxies["primary"].State.SetCrashed(true)
 	proxies["replica-1"].State.SetLatency(500)
 
-	err := eng.Run(&config.Scenario{
+	err := eng.Run(context.Background(), &config.Scenario{
 		Name:  "recover-primary",
 		Steps: []config.FaultStep{{Node: "primary", Kind: "heal"}},
 	})
@@ -80,5 +82,85 @@ func TestHealStepAndHealAll(t *testing.T) {
 	eng.HealAll()
 	if st := proxies["replica-1"].Status(); st.LatencyMs != 0 {
 		t.Error("HealAll did not clear all faults")
+	}
+}
+
+func TestApplyGeneralFormRegistersOnRegistryAndExpires(t *testing.T) {
+	eng, proxies := testEngine()
+	err := eng.Apply(context.Background(), config.FaultStep{
+		Node: "replica-1", Kind: "reorder", Params: map[string]any{"buffer_size": float64(3)}, ForMs: 150,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := proxies["replica-1"].Registry.Names(); len(names) != 1 || names[0] != "reorder" {
+		t.Fatalf("registry = %v", names)
+	}
+	if n := proxies["primary"].Registry.Names(); len(n) != 0 {
+		t.Fatal("fault leaked to another node")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if n := proxies["replica-1"].Registry.Names(); len(n) != 0 {
+		t.Fatalf("fault not removed after for_ms: %v", n)
+	}
+}
+
+func TestApplyStarTargetsEveryProxy(t *testing.T) {
+	eng, proxies := testEngine()
+	if err := eng.Apply(context.Background(), config.FaultStep{Node: "*", Kind: "latency", Params: map[string]any{"delay": "300ms"}}); err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range proxies {
+		if p.Status().LatencyMs != 300 {
+			t.Errorf("%s latency = %d", name, p.Status().LatencyMs)
+		}
+	}
+	if err := eng.Apply(context.Background(), config.FaultStep{Node: "*", Kind: "heal"}); err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range proxies {
+		if p.Status().LatencyMs != 0 {
+			t.Errorf("%s not healed", name)
+		}
+	}
+}
+
+func TestPartitionForWindowClears(t *testing.T) {
+	eng, proxies := testEngine()
+	if err := eng.Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "partition", ForMs: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if !proxies["primary"].Status().Partitioned {
+		t.Fatal("not partitioned")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if proxies["primary"].Status().Partitioned {
+		t.Fatal("partition did not clear after for_ms")
+	}
+}
+
+func TestNodeFaultNeedsContainerID(t *testing.T) {
+	proxies := map[string]*proxy.Proxy{"primary": proxy.New("primary", "127.0.0.1:0", "127.0.0.1:1")}
+	cfg := &config.Config{Nodes: []config.Node{{Name: "primary", ListenAddr: "a", UpstreamAddr: "b"}}}
+	eng := New(proxies, cfg)
+	if err := eng.Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "zombie"}); err == nil {
+		t.Fatal("zombie without container_id should fail")
+	}
+	if err := New(proxies, nil).Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "node_crash"}); err == nil {
+		t.Fatal("node fault without config should fail")
+	}
+}
+
+func TestRunOrdersStepsByAfterMs(t *testing.T) {
+	eng, proxies := testEngine()
+	err := eng.Run(context.Background(), &config.Scenario{Name: "order", Steps: []config.FaultStep{
+		{Node: "primary", Kind: "heal", AfterMs: 60},
+		{Node: "primary", Kind: "partition", AfterMs: 0},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxies["primary"].Status().Partitioned {
+		t.Fatal("steps were not applied in after_ms order")
 	}
 }

@@ -4,6 +4,7 @@
 package control
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
@@ -112,13 +113,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statuses)
 }
 
-// faultRequest is the body of POST /nodes/{node}/fault, e.g.:
+// faultRequest is the body of POST /nodes/{node}/fault. It is a
+// config.FaultStep without the node (which comes from the URL), e.g.:
 //
 //	POST /nodes/replica-1/fault {"kind": "latency", "latency_ms": 3000}
+//	POST /nodes/replica-1/fault {"kind": "reorder", "params": {"buffer_size": 5}, "for_ms": 5000}
 type faultRequest struct {
-	Kind        string `json:"kind"`
-	LatencyMs   int    `json:"latency_ms"`
-	DropPercent int    `json:"drop_percent"`
+	Kind        string         `json:"kind"`
+	LatencyMs   int            `json:"latency_ms"`
+	DropPercent int            `json:"drop_percent"`
+	Params      map[string]any `json:"params,omitempty"`
+	ForMs       int            `json:"for_ms,omitempty"`
 }
 
 func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
@@ -133,19 +138,16 @@ func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	switch req.Kind {
-	case "latency":
-		p.State.SetLatency(req.LatencyMs)
-	case "drop":
-		p.State.SetDrop(req.DropPercent)
-	case "partition":
-		p.State.SetPartitioned(true)
-	case "crash":
-		p.State.SetCrashed(true)
-	case "heal":
-		p.State.Heal()
-	default:
-		http.Error(w, "unknown fault kind: "+req.Kind, http.StatusBadRequest)
+	step := config.FaultStep{
+		Node:        node,
+		Kind:        req.Kind,
+		LatencyMs:   req.LatencyMs,
+		DropPercent: req.DropPercent,
+		Params:      req.Params,
+		ForMs:       req.ForMs,
+	}
+	if err := s.engine.Apply(r.Context(), step); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, http.StatusOK, p.Status())
@@ -159,7 +161,7 @@ func (s *Server) handleScenarioRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go func() {
-		if err := s.engine.Run(sc); err != nil {
+		if err := s.engine.Run(context.Background(), sc); err != nil {
 			log.Printf("scenario %q failed: %v", name, err)
 		}
 	}()

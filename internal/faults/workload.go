@@ -44,7 +44,7 @@ func (s *SQLDBSession) PoolStats() PoolStats {
 
 type sqlTx struct{ tx *sql.Tx }
 
-func (t *sqlTx) Exec(ctx context.Context, query string, args ...interface{}) error {
+func (t *sqlTx) Exec(ctx context.Context, query string, args ...any) error {
 	_, err := t.tx.ExecContext(ctx, query, args...)
 	return err
 }

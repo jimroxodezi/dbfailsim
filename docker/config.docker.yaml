@@ -1,0 +1,69 @@
+# Configuration for the docker-compose harness (see docker/docker-compose.yml).
+control_addr: 0.0.0.0:8080
+control_token: chaos-demo-token
+nodes:
+- name: primary
+  role: primary
+  container_id: dbfailsim-primary
+  listen_addr: 0.0.0.0:6432
+  upstream_addr: postgres-primary:5432
+  check_command: PGPASSWORD=apppass psql -h postgres-primary -U appuser -d appdb -t -c "{query}"
+- name: replica
+  role: replica
+  container_id: dbfailsim-replica
+  listen_addr: 0.0.0.0:6433
+  upstream_addr: postgres-replica:5432
+  check_command: PGPASSWORD=apppass psql -h postgres-replica -U appuser -d appdb -t -c "{query}"
+scenarios:
+- name: replica-lag
+  description: 'Replica falls behind: added latency plus intermittent drops on its replication path'
+  steps:
+  - node: replica
+    kind: latency
+    latency_ms: 2000
+    after_ms: 0
+  - node: replica
+    kind: drop
+    drop_percent: 15
+    after_ms: 0
+- name: split-brain
+  description: Both nodes isolated from clients at once, simulating a full network split
+  steps:
+  - node: primary
+    kind: partition
+    after_ms: 0
+  - node: replica
+    kind: partition
+    after_ms: 3000
+- name: primary-crash
+  description: Primary crashes outright partway through a batch of writes
+  steps:
+  - node: primary
+    kind: crash
+    after_ms: 3000
+- name: flaky-replica
+  description: 'General-form faults: bursty loss plus reordering on the replica for 20s, then a real SIGKILL
+    of its container'
+  steps:
+  - node: replica
+    kind: bursty_loss
+    after_ms: 0
+    for_ms: 20000
+    params:
+      baseline_loss: 0.02
+      burst_loss: 0.5
+      burst_every: 5s
+      burst_for: 1s
+  - node: replica
+    kind: reorder
+    after_ms: 0
+    for_ms: 20000
+    params:
+      buffer_size: 3
+      probability: 0.2
+  - node: replica
+    kind: node_crash
+    after_ms: 25000
+    for_ms: 10000
+    params:
+      signal: SIGKILL

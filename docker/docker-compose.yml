@@ -49,12 +49,12 @@ services:
       - postgres-primary
       - postgres-replica
     volumes:
-      - ./config.docker.json:/app/config.json:ro
+      - ./config.docker.yaml:/app/config.yaml:ro
     ports:
       - "6432:6432" # proxy in front of the primary - point your app here
       - "6433:6433" # proxy in front of the replica
       - "8080:8080" # web dashboard: http://localhost:8080
-    command: ["serve", "--config", "/app/config.json"]
+    command: ["serve", "--config", "/app/config.yaml"]
 
 volumes:
   primary-data:

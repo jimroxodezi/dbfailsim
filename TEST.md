@@ -37,24 +37,21 @@ Useful for verifying the serve/inject/heal loop without touching a database:
 ncat -l -k 127.0.0.1 5555 --exec /bin/cat    # or: socat TCP-LISTEN:5555,fork,reuseaddr EXEC:/bin/cat
 
 # Terminal 2: minimal config + serve
-cat > smoke.json <<'EOF'
-{
-  "control_addr": "127.0.0.1:8080",
-  "nodes": [
-    {"name": "fake", "listen_addr": "127.0.0.1:6555", "upstream_addr": "127.0.0.1:5555"}
-  ]
-}
+cat > smoke.yaml <<'EOF'
+control_addr: 127.0.0.1:8080
+nodes:
+  - {name: fake, listen_addr: 127.0.0.1:6555, upstream_addr: 127.0.0.1:5555}
 EOF
 go build -o dbfailsim ./cmd/dbfailsim
-./dbfailsim serve --config smoke.json
+./dbfailsim serve --config smoke.yaml
 
 # Terminal 3: talk through the proxy and inject faults
 ncat 127.0.0.1 6555                    # type a line, see it echoed
-./dbfailsim fault --config smoke.json --node fake --kind latency --value 2000
+./dbfailsim fault --config smoke.yaml --node fake --kind latency --value 2000
 # ... typed lines now echo back ~2s late
-./dbfailsim fault --config smoke.json --node fake --kind partition
+./dbfailsim fault --config smoke.yaml --node fake --kind partition
 # ... the ncat session is severed; reconnecting fails
-./dbfailsim heal --config smoke.json
+./dbfailsim heal --config smoke.yaml
 ```
 
 ## 3. End-to-end with real databases
@@ -141,14 +138,14 @@ docker run -d --name pg1 -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres:16
 docker run -d --name pg2 -e POSTGRES_PASSWORD=pass -p 5433:5432 postgres:16
 ```
 
-Then adapt `config.example.json`: `upstream_addr` `127.0.0.1:5432` /
+Then adapt `config.example.yaml`: `upstream_addr` `127.0.0.1:5432` /
 `127.0.0.1:5433`, and `check_command` like:
 
 ```
 psql "postgresql://postgres:pass@127.0.0.1:5432/postgres" -t -c "{query}"
 ```
 
-Run `./dbfailsim serve --config config.json` and point `psql` at the
+Run `./dbfailsim serve --config config.yaml` and point `psql` at the
 proxy ports (`6432`/`6433`).
 
 ### 3c. Neon-hosted Postgres
