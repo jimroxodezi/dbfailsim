@@ -3,11 +3,13 @@ package scenario
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"syscall"
 	"time"
 
 	"github.com/jimroxodezi/dbfailsim/internal/faults"
+	"github.com/jimroxodezi/dbfailsim/internal/proxy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,16 +30,21 @@ func Load(path string) (*Config, error) {
 // configured offset and reverting node-level faults after their `for`
 // window elapses.
 type Runner struct {
-	cfg   *Config
-	nodes map[string]NodeConfig
+	cfg     *Config
+	nodes   map[string]NodeConfig
+	proxies map[string]*proxy.Proxy // keyed by node name; each owns its fault Registry
 }
 
-func NewRunner(cfg *Config) *Runner {
+// NewRunner creates a Runner over the live proxies. Connection-, packet-,
+// dial-, and read-hook faults are registered on the proxy named by each
+// FaultSpec.Target ("*" = every proxy); node faults use the container ID
+// from cfg.Nodes.
+func NewRunner(cfg *Config, proxies map[string]*proxy.Proxy) *Runner {
 	nodes := make(map[string]NodeConfig, len(cfg.Nodes))
 	for _, n := range cfg.Nodes {
 		nodes[n.Name] = n
 	}
-	return &Runner{cfg: cfg, nodes: nodes}
+	return &Runner{cfg: cfg, nodes: nodes, proxies: proxies}
 }
 
 // Run executes the named scenario to completion (blocking).
@@ -84,14 +91,14 @@ func (r *Runner) fireFault(ctx context.Context, fs FaultSpec) error {
 			BufferSize:  intParam(fs.Params, "buffer_size", 5),
 			Probability: floatParam(fs.Params, "probability", 0.1),
 		}
-		return registerConnFault(f)
+		return r.registerConn(fs, f)
 
 	case "duplication":
 		f := &faults.DuplicationFault{
 			Probability:    floatParam(fs.Params, "probability", 0.05),
 			MaxExtraCopies: intParam(fs.Params, "max_extra_copies", 1),
 		}
-		return registerConnFault(f)
+		return r.registerConn(fs, f)
 
 	case "asymmetric_partition":
 		dir := faults.DirectionClientToUpstream
@@ -99,11 +106,11 @@ func (r *Runner) fireFault(ctx context.Context, fs FaultSpec) error {
 			dir = faults.DirectionUpstreamToClient
 		}
 		f := &faults.AsymmetricPartitionFault{BlockDirection: dir}
-		return registerConnFault(f)
+		return r.registerConn(fs, f)
 
 	case "tcp_rst":
 		f := &faults.RSTFault{}
-		return registerConnFault(f)
+		return r.registerConn(fs, f)
 
 	case "bursty_loss":
 		f := &faults.BurstyLossFault{
@@ -112,7 +119,7 @@ func (r *Runner) fireFault(ctx context.Context, fs FaultSpec) error {
 			BurstEvery:   durationParam(fs.Params, "burst_every", 30*time.Second),
 			BurstFor:     durationParam(fs.Params, "burst_for", 5*time.Second),
 		}
-		return registerConnFault(f)
+		return r.registerConn(fs, f)
 
 	case "crash":
 		sig := syscall.SIGKILL
@@ -141,14 +148,67 @@ func (r *Runner) fireFault(ctx context.Context, fs FaultSpec) error {
 			Delay:  durationParam(fs.Params, "delay", 2*time.Second),
 			Jitter: durationParam(fs.Params, "jitter", 0),
 		}
-		return registerPacketFault(f)
+		return r.registerPacket(fs, f)
 
 	case "stale_read":
 		f := faults.NewStaleReadFault(
 			floatParam(fs.Params, "probability", 0.3),
 			durationParam(fs.Params, "max_age", 10*time.Second),
 		)
-		return registerReadHook(f)
+		return r.registerReadHook(fs, f)
+
+	case "latency":
+		f := faults.NewLatencyInjectionFault(
+			durationParam(fs.Params, "delay", 500*time.Millisecond),
+			durationParam(fs.Params, "jitter", 0),
+		)
+		f.RampTo = durationParam(fs.Params, "ramp_to", 0)
+		f.RampOver = durationParam(fs.Params, "ramp_over", 0)
+		return r.registerConn(fs, f)
+
+	case "bandwidth_throttle":
+		f := faults.NewBandwidthThrottleFault(
+			int64(intParam(fs.Params, "rate_bytes_per_sec", 64*1024)),
+			int64(intParam(fs.Params, "burst_bytes", 64*1024)),
+		)
+		return r.registerConn(fs, f)
+
+	case "dns_failure":
+		// ServiceName must equal the host part of the proxy's upstream
+		// address, which is what the proxy passes to BeforeDial.
+		for _, p := range r.targets(fs) {
+			host, _, err := net.SplitHostPort(p.UpstreamAddr)
+			if err != nil {
+				host = p.UpstreamAddr
+			}
+			f := &faults.DNSFailureFault{ServiceName: strParam(fs.Params, "service", host)}
+			window := fs.For.Duration
+			if window <= 0 {
+				window = 24 * time.Hour // until healed
+			}
+			f.Trigger(window)
+			p.Registry.RegisterDialFault(f)
+			r.expire(ctx, fs, p.Registry, f.Name())
+		}
+		return nil
+
+	case "wal_delay":
+		f := &faults.WALDelayFault{FlushDelay: durationParam(fs.Params, "flush_delay", time.Second)}
+		return r.registerPacket(fs, f)
+
+	case "wal_corruption":
+		f := &faults.WALCorruptionFault{
+			Probability: floatParam(fs.Params, "probability", 0.01),
+			BytesToFlip: intParam(fs.Params, "bytes_to_flip", 1),
+		}
+		return r.registerPacket(fs, f)
+
+	case "query_corruption":
+		f := &faults.QueryCorruptionFault{
+			Probability: floatParam(fs.Params, "probability", 0.01),
+			BytesToFlip: intParam(fs.Params, "bytes_to_flip", 1),
+		}
+		return r.registerPacket(fs, f)
 
 	default:
 		return fmt.Errorf("unknown fault type %q", fs.Type)
@@ -177,14 +237,86 @@ func (r *Runner) runNodeFault(ctx context.Context, nf faults.NodeFault, fs Fault
 	return nil
 }
 
-// --- registration hooks (wired to the live proxy's fault chain/registry
-// elsewhere in fluxproxy — stubbed here since that registry lives in the
-// proxy package, not this scenario package).
+// targets resolves fs.Target to proxies: "*" (or empty) means all.
+func (r *Runner) targets(fs FaultSpec) []*proxy.Proxy {
+	if fs.Target == "*" || fs.Target == "" {
+		out := make([]*proxy.Proxy, 0, len(r.proxies))
+		for _, p := range r.proxies {
+			out = append(out, p)
+		}
+		return out
+	}
+	if p, ok := r.proxies[fs.Target]; ok {
+		return []*proxy.Proxy{p}
+	}
+	return nil
+}
 
-func registerConnFault(f faults.Fault) error         { return proxyRegistry.RegisterConnFault(f) }
-func registerPacketFault(f faults.PacketFault) error  { return proxyRegistry.RegisterPacketFault(f) }
-func registerReadHook(f *faults.StaleReadFault) error { return proxyRegistry.RegisterReadHook(f) }
+func (r *Runner) checkTargets(fs FaultSpec) ([]*proxy.Proxy, error) {
+	ps := r.targets(fs)
+	if len(ps) == 0 {
+		return nil, fmt.Errorf("fault %s: unknown target proxy %q", fs.Type, fs.Target)
+	}
+	return ps, nil
+}
 
+func (r *Runner) registerConn(fs FaultSpec, f faults.Fault) error {
+	ps, err := r.checkTargets(fs)
+	if err != nil {
+		return err
+	}
+	for _, p := range ps {
+		p.Registry.RegisterConnFault(f)
+		r.expire(context.Background(), fs, p.Registry, f.Name())
+	}
+	return nil
+}
+
+func (r *Runner) registerPacket(fs FaultSpec, f faults.PacketFault) error {
+	ps, err := r.checkTargets(fs)
+	if err != nil {
+		return err
+	}
+	for _, p := range ps {
+		p.Registry.RegisterPacketFault(f)
+		r.expire(context.Background(), fs, p.Registry, f.Name())
+	}
+	return nil
+}
+
+func (r *Runner) registerReadHook(fs FaultSpec, f *faults.StaleReadFault) error {
+	ps, err := r.checkTargets(fs)
+	if err != nil {
+		return err
+	}
+	for _, p := range ps {
+		p.Registry.RegisterReadHook(f)
+		r.expire(context.Background(), fs, p.Registry, f.Name())
+	}
+	return nil
+}
+
+// expire unregisters name from reg after fs.For, mirroring runNodeFault's
+// Revert scheduling. A fault with no `for` stays until healed.
+func (r *Runner) expire(ctx context.Context, fs FaultSpec, reg *proxy.Registry, name string) {
+	if fs.For.Duration <= 0 {
+		return
+	}
+	go func() {
+		select {
+		case <-time.After(fs.For.Duration):
+			reg.Unregister(name)
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// HealAll clears every proxy's registry and partition/crash flags.
+func (r *Runner) HealAll() {
+	for _, p := range r.proxies {
+		p.State.Heal()
+	}
+}
 
 func intParam(m map[string]any, key string, def int) int {
 	if v, ok := m[key]; ok {

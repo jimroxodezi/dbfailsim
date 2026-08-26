@@ -3,28 +3,34 @@
 // It works by byte-copying between a client connection and the real
 // upstream database, so it doesn't need to understand Postgres wire
 // protocol, MySQL wire protocol, or anything else — it works with any
-// TCP-based database. Faults are applied to the copy loops:
+// TCP-based database. Faults come from the faults package and plug in at
+// three points:
 //
-//   - latency:   sleep before forwarding each chunk (simulates replication/network delay)
-//   - drop:      probabilistically discard a chunk instead of forwarding it (simulates packet loss / lag spikes)
-//   - partition: refuse all new connections and hang up existing ones (simulates a network partition / split brain)
-//   - crash:     immediately close all connections and refuse new ones (simulates a node crash)
+//   - DialFault:   consulted before every upstream dial (DNS failure)
+//   - Fault:       wraps each pump's destination conn (latency, loss,
+//     throttle, reorder, duplication, RST, one-way partition)
+//   - PacketFault: runs on every chunk in the pump, gated by the proxy's
+//     StreamType (replica lag, WAL delay/corruption, query corruption)
+//
+// plus StaleReadFault as a read hook on the reply leg. Which faults are
+// live is held per node in a Registry. Full partition and crash are not
+// faults on the wire but on the accept loop, so they stay in State.
 package proxy
 
 import (
+	"context"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/jimroxodezi/dbfailsim/internal/faults"
 )
 
-// State is the current fault-injection state for one node's proxy.
-// All fields are guarded by mu and safe for concurrent read/update.
+// State keeps only what a conn wrapper cannot express: refusing accepts
+// and severing live conns. All fields are guarded by mu.
 type State struct {
 	mu          sync.RWMutex
-	latencyMs   int
-	dropPercent int
 	partitioned bool
 	crashed     bool
 
@@ -32,26 +38,37 @@ type State struct {
 	// crashed, so the owning proxy can tear down existing connections
 	// immediately instead of waiting for pumps to notice.
 	onSever func()
+
+	// reg is the owning proxy's registry; SetLatency/SetDrop/Heal are
+	// thin shims over it so the control API and old Engine keep working.
+	reg *Registry
 }
 
-func (s *State) snapshot() (latencyMs, dropPercent int, partitioned, crashed bool) {
+func (s *State) severed() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.latencyMs, s.dropPercent, s.partitioned, s.crashed
+	return s.partitioned || s.crashed
 }
 
-// SetLatency sets an added delay (ms) applied to every forwarded chunk in both directions.
+// SetLatency installs (or retunes) a fixed latency fault of ms on both
+// directions. 0 removes it.
 func (s *State) SetLatency(ms int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.latencyMs = ms
+	if ms <= 0 {
+		s.reg.Unregister("latency")
+		return
+	}
+	s.reg.RegisterConnFault(faults.NewLatencyInjectionFault(time.Duration(ms)*time.Millisecond, 0))
 }
 
-// SetDrop sets the percent chance (0-100) that a chunk is silently dropped.
+// SetDrop installs (or retunes) a uniform loss fault of percent. 0
+// removes it. Uniform loss is BurstyLossFault with baseline == burst.
 func (s *State) SetDrop(percent int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.dropPercent = percent
+	if percent <= 0 {
+		s.reg.Unregister("bursty_loss")
+		return
+	}
+	rate := float64(percent) / 100
+	s.reg.RegisterConnFault(&faults.BurstyLossFault{BaselineLoss: rate, BurstLoss: rate})
 }
 
 // SetPartitioned marks the node as network-partitioned: existing connections
@@ -80,26 +97,30 @@ func (s *State) SetCrashed(v bool) {
 	}
 }
 
-// Heal clears all fault conditions, returning the node to normal operation.
+// Heal clears all fault conditions — the flags here and every fault in
+// the registry — returning the node to normal operation.
 func (s *State) Heal() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.latencyMs = 0
-	s.dropPercent = 0
 	s.partitioned = false
 	s.crashed = false
+	s.mu.Unlock()
+	s.reg.Clear()
 }
 
 // Status is a point-in-time snapshot of a node's health, safe to serialize.
+// LatencyMs/DropPercent report the "latency"/"bursty_loss" faults when
+// present, for the dashboard and CLI; ActiveFaults lists everything.
 type Status struct {
-	Name          string `json:"name"`
-	ListenAddr    string `json:"listen_addr"`
-	UpstreamAddr  string `json:"upstream_addr"`
-	LatencyMs     int    `json:"latency_ms"`
-	DropPercent   int    `json:"drop_percent"`
-	Partitioned   bool   `json:"partitioned"`
-	Crashed       bool   `json:"crashed"`
-	ActiveClients int    `json:"active_clients"`
+	Name          string   `json:"name"`
+	ListenAddr    string   `json:"listen_addr"`
+	UpstreamAddr  string   `json:"upstream_addr"`
+	Stream        string   `json:"stream"`
+	LatencyMs     int      `json:"latency_ms"`
+	DropPercent   int      `json:"drop_percent"`
+	Partitioned   bool     `json:"partitioned"`
+	Crashed       bool     `json:"crashed"`
+	ActiveFaults  []string `json:"active_faults"`
+	ActiveClients int      `json:"active_clients"`
 }
 
 // Proxy fronts a single upstream database node.
@@ -108,12 +129,29 @@ type Proxy struct {
 	ListenAddr   string
 	UpstreamAddr string
 	State        *State
+	Registry     *Registry
+
+	// Stream classifies every byte through this proxy. There is no
+	// protocol parser: the proxy fronting the primary's replication port
+	// is configured as ReplicationStream, everything else is query
+	// traffic. PacketFaults gate on this.
+	Stream faults.StreamType
+
+	// Optional topology hookup for inter-node proxies (e.g. a replication
+	// proxy: FromNode="replica-1", ToNode="primary"). Empty FromNode means
+	// client-facing: the ClusterView is not consulted.
+	View     faults.ClusterView
+	FromNode string
+	ToNode   string
 
 	listener net.Listener
 	active   int
 	activeMu sync.Mutex
-	conns    map[net.Conn]struct{}
-	connsMu  sync.Mutex
+
+	// conns maps each live conn to the cancel func of its session, so
+	// severConns both closes sockets and ends any PacketFault sleep.
+	conns   map[net.Conn]context.CancelFunc
+	connsMu sync.Mutex
 }
 
 // New creates a Proxy for the given node. Call Start to begin listening.
@@ -123,9 +161,11 @@ func New(name, listenAddr, upstreamAddr string) *Proxy {
 		ListenAddr:   listenAddr,
 		UpstreamAddr: upstreamAddr,
 		State:        &State{},
-		conns:        make(map[net.Conn]struct{}),
+		Registry:     NewRegistry(),
+		conns:        make(map[net.Conn]context.CancelFunc),
 	}
 	p.State.onSever = p.severConns
+	p.State.reg = p.Registry
 	return p
 }
 
@@ -159,6 +199,19 @@ func (p *Proxy) Addr() string {
 	return p.listener.Addr().String()
 }
 
+// allowed is the single reachability check used by Serve and pump: the
+// node's own partition/crash flags plus, for inter-node proxies, the
+// cluster topology.
+func (p *Proxy) allowed() bool {
+	if p.State.severed() {
+		return false
+	}
+	if p.View != nil && p.FromNode != "" && !p.View.Allowed(p.FromNode, p.ToNode) {
+		return false
+	}
+	return true
+}
+
 // Serve accepts and proxies connections until the listener is closed.
 func (p *Proxy) Serve() error {
 	l := p.listener
@@ -169,8 +222,7 @@ func (p *Proxy) Serve() error {
 		if err != nil {
 			return err // listener closed
 		}
-		_, _, partitioned, crashed := p.State.snapshot()
-		if partitioned || crashed {
+		if !p.allowed() {
 			// Simulate an unreachable node: refuse the connection outright.
 			conn.Close()
 			continue
@@ -189,35 +241,52 @@ func (p *Proxy) Close() error {
 
 // Status returns a snapshot of this proxy's current health.
 func (p *Proxy) Status() Status {
-	latencyMs, dropPercent, partitioned, crashed := p.State.snapshot()
+	p.State.mu.RLock()
+	partitioned, crashed := p.State.partitioned, p.State.crashed
+	p.State.mu.RUnlock()
 	p.activeMu.Lock()
 	active := p.active
 	p.activeMu.Unlock()
-	return Status{
+
+	st := Status{
 		Name:          p.Name,
 		ListenAddr:    p.ListenAddr,
 		UpstreamAddr:  p.UpstreamAddr,
-		LatencyMs:     latencyMs,
-		DropPercent:   dropPercent,
+		Stream:        "query",
 		Partitioned:   partitioned,
 		Crashed:       crashed,
+		ActiveFaults:  p.Registry.Names(),
 		ActiveClients: active,
 	}
+	if p.Stream == faults.ReplicationStream {
+		st.Stream = "replication"
+	}
+	if f, ok := p.Registry.Get("latency").(*faults.LatencyInjectionFault); ok {
+		st.LatencyMs = int(f.CurrentDelay() / time.Millisecond)
+	}
+	if f, ok := p.Registry.Get("bursty_loss").(*faults.BurstyLossFault); ok {
+		st.DropPercent = int(f.CurrentLossRate()*100 + 0.5)
+	}
+	return st
 }
 
-// severConns closes every live connection so blocked pump reads unblock and
-// exit as soon as the node becomes unreachable.
+// SeverConns closes every live connection and cancels its session. It is
+// exported so the scenario runner can call it after a TopologyFault
+// changes ClusterView — the view has no hook of its own.
+func (p *Proxy) SeverConns() { p.severConns() }
+
 func (p *Proxy) severConns() {
 	p.connsMu.Lock()
 	defer p.connsMu.Unlock()
-	for c := range p.conns {
+	for c, cancel := range p.conns {
+		cancel()
 		c.Close()
 	}
 }
 
-func (p *Proxy) track(c net.Conn) {
+func (p *Proxy) track(c net.Conn, cancel context.CancelFunc) {
 	p.connsMu.Lock()
-	p.conns[c] = struct{}{}
+	p.conns[c] = cancel
 	p.connsMu.Unlock()
 }
 
@@ -227,24 +296,49 @@ func (p *Proxy) untrack(c net.Conn) {
 	p.connsMu.Unlock()
 }
 
+// session is the per-connection state shared by the two pumps.
+type session struct {
+	ctx context.Context
+
+	// lastQuery is the most recent client->upstream chunk, so the reply
+	// pump can pair a response with its query for StaleReadFault.
+	// Chunk-granular: right for a single-chunk SELECT, approximate for
+	// multi-chunk result sets (needs protocol framing to do better).
+	mu        sync.Mutex
+	lastQuery []byte
+}
+
 func (p *Proxy) handle(client net.Conn) {
 	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	upstream, err := net.Dial("tcp", p.UpstreamAddr)
+	// DialFault hook: fail resolution before any socket exists.
+	host, _, err := net.SplitHostPort(p.UpstreamAddr)
+	if err != nil {
+		host = p.UpstreamAddr
+	}
+	for _, d := range p.Registry.DialFaults() {
+		if err := d.BeforeDial(ctx, host); err != nil {
+			log.Printf("[%s] dial fault %s: %v", p.Name, d.Name(), err)
+			return
+		}
+	}
+	upstream, err := (&net.Dialer{}).DialContext(ctx, "tcp", p.UpstreamAddr)
 	if err != nil {
 		log.Printf("[%s] failed to dial upstream %s: %v", p.Name, p.UpstreamAddr, err)
 		return
 	}
 	defer upstream.Close()
 
-	p.track(client)
-	p.track(upstream)
+	p.track(client, cancel)
+	p.track(upstream, cancel)
 	defer p.untrack(client)
 	defer p.untrack(upstream)
 
 	// Re-check after tracking: a partition/crash set between Accept and
 	// track would otherwise leave these connections open.
-	if _, _, partitioned, crashed := p.State.snapshot(); partitioned || crashed {
+	if !p.allowed() {
 		return
 	}
 
@@ -257,40 +351,73 @@ func (p *Proxy) handle(client net.Conn) {
 		p.activeMu.Unlock()
 	}()
 
+	// Conn faults wrap each pump's DESTINATION, tagged with the direction
+	// of the bytes written into it (the faults package acts on Write).
+	toUpstream := p.Registry.Wrap(upstream, faults.DirectionClientToUpstream)
+	toClient := p.Registry.Wrap(client, faults.DirectionUpstreamToClient)
+
+	s := &session{ctx: ctx}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		p.pump(client, upstream)
+		defer cancel() // one leg dying ends any fault sleep on the other
+		p.pump(s, client, toUpstream, faults.DirectionClientToUpstream)
 	}()
 	go func() {
 		defer wg.Done()
-		p.pump(upstream, client)
+		defer cancel()
+		p.pump(s, upstream, toClient, faults.DirectionUpstreamToClient)
 	}()
 	wg.Wait()
 }
 
-// pump copies bytes from src to dst, applying the current fault state to
-// each chunk. It stops when either side closes; a partition or crash closes
-// both connections (see severConns), which unblocks the read here.
-func (p *Proxy) pump(src, dst net.Conn) {
+// pump copies src -> dst. Per chunk: reachability re-check, PacketFaults
+// (ctx-aware, may sleep, mutate, or drop), read hooks on the reply leg,
+// then the write — where the wrapped dst applies conn-level faults. It
+// stops when either side closes; a partition or crash closes both
+// connections (see severConns), which unblocks the read here.
+func (p *Proxy) pump(s *session, src, dst net.Conn, dir faults.Direction) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			latencyMs, dropPercent, partitioned, crashed := p.State.snapshot()
-			if partitioned || crashed {
-				// Sever the connection to simulate the node becoming unreachable.
-				return
+			if !p.allowed() {
+				return // severed mid-flight: partition, crash, or topology
 			}
-			if dropPercent > 0 && rand.Intn(100) < dropPercent {
-				// Silently discard this chunk: simulates a lost packet /
-				// replication delay that never catches up.
-			} else {
-				if latencyMs > 0 {
-					time.Sleep(time.Duration(latencyMs) * time.Millisecond)
+			chunk := buf[:n]
+
+			for _, pf := range p.Registry.PacketFaults() {
+				chunk = pf.Apply(s.ctx, chunk, p.Stream)
+				if s.ctx.Err() != nil {
+					return
 				}
-				if _, werr := dst.Write(buf[:n]); werr != nil {
+				if len(chunk) == 0 {
+					break // dropped
+				}
+			}
+
+			switch dir {
+			case faults.DirectionClientToUpstream:
+				s.mu.Lock()
+				s.lastQuery = append(s.lastQuery[:0], chunk...)
+				s.mu.Unlock()
+			case faults.DirectionUpstreamToClient:
+				if hooks := p.Registry.ReadHooks(); len(hooks) > 0 {
+					s.mu.Lock()
+					q := append([]byte(nil), s.lastQuery...)
+					s.mu.Unlock()
+					// Hooks cache what they are given; hand them a copy,
+					// not a window onto buf that the next Read overwrites.
+					chunk = append([]byte(nil), chunk...)
+					for _, h := range hooks {
+						chunk = h.MaybeServeStale(q, chunk)
+					}
+				}
+			}
+
+			if len(chunk) > 0 {
+				if _, werr := dst.Write(chunk); werr != nil {
 					return
 				}
 			}
