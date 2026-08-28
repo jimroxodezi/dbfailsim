@@ -147,13 +147,15 @@ type PacketFault interface {
 
 // NodeFault is the interface for faults that act on a whole node/process
 // rather than a single connection (crash, clock skew, resource pressure).
-// Inject/Revert take a context because the underlying action (docker
-// kill/exec/update) is a real blocking subprocess call that should be
-// cancellable if the scenario is torn down mid-fault.
+// The fault states intent; the NodeDriver (driver.go) supplies the
+// mechanism for whatever the node actually is — a local process, a
+// systemd unit, a container, or one of those over ssh. Inject/Revert take
+// a context because the underlying action is a real blocking subprocess
+// call that should be cancellable if the scenario is torn down mid-fault.
 type NodeFault interface {
 	Name() string
-	Inject(ctx context.Context, nodeID string) error
-	Revert(ctx context.Context, nodeID string) error
+	Inject(ctx context.Context, node NodeDriver) error
+	Revert(ctx context.Context, node NodeDriver) error
 }
 
 // Topology faults

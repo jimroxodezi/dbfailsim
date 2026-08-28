@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -45,7 +46,7 @@ func (s *Server) ListenAndServe(addr string) error {
 	if s.cfg.ControlToken == "" {
 		log.Printf("WARNING: control API is UNAUTHENTICATED — anyone who can reach %s can inject faults and run check commands. Set control_token in the config (or DBFAILSIM_CONTROL_TOKEN) before exposing it beyond localhost.", addr)
 	}
-	log.Printf("dashboard + control API at http://%s (GET /status /scenarios /check, POST /nodes/{node}/fault /scenarios/{name}/run /heal)", addr)
+	log.Printf("dashboard + control API at http://%s (GET /status /kinds /scenarios /check, POST /nodes/{node}/fault /scenarios/{name}/run /heal, DELETE /nodes/{node}/faults/{name})", addr)
 	return http.ListenAndServe(addr, h)
 }
 
@@ -96,7 +97,9 @@ func (s *Server) Handler() (http.Handler, error) {
 			api.Use(requireBearerToken(s.cfg.ControlToken))
 		}
 		api.Get("/status", s.handleStatus)
+		api.Get("/kinds", s.handleKinds)
 		api.Post("/nodes/{node}/fault", s.handleFault)
+		api.Delete("/nodes/{node}/faults/{name}", s.handleFaultRemove)
 		api.Get("/scenarios", s.handleScenarios)
 		api.Post("/scenarios/{name}/run", s.handleScenarioRun)
 		api.Post("/heal", s.handleHeal)
@@ -105,12 +108,81 @@ func (s *Server) Handler() (http.Handler, error) {
 	return r, nil
 }
 
+// NodeStatus is one node's live state: the proxy's view plus the config
+// metadata and node-level faults that the proxy does not know about.
+type NodeStatus struct {
+	proxy.Status
+	Role       string   `json:"role,omitempty"`
+	Target     string   `json:"target,omitempty"` // e.g. "docker:dbfailsim-primary"; empty = proxy-only node
+	NodeFaults []string `json:"node_faults"`
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	var statuses []proxy.Status
-	for _, p := range s.proxies {
-		statuses = append(statuses, p.Status())
+	outstanding := s.engine.Outstanding()
+	statuses := make([]NodeStatus, 0, len(s.cfg.Nodes))
+	// Config order, so the dashboard is stable across polls.
+	for _, n := range s.cfg.Nodes {
+		p, ok := s.proxies[n.Name]
+		if !ok {
+			continue
+		}
+		st := NodeStatus{Status: p.Status(), Role: n.Role, NodeFaults: outstanding[n.Name]}
+		if st.NodeFaults == nil {
+			st.NodeFaults = []string{}
+		}
+		if n.Target != nil {
+			st.Target = describeTarget(n.Target)
+		}
+		statuses = append(statuses, st)
 	}
 	writeJSON(w, http.StatusOK, statuses)
+}
+
+func describeTarget(t *config.NodeTarget) string {
+	switch t.Type {
+	case "process":
+		if t.PID > 0 {
+			return fmt.Sprintf("process:%d", t.PID)
+		}
+		return "process:" + t.PIDFile
+	case "docker":
+		return "docker:" + t.Container
+	case "systemd":
+		return "systemd:" + t.Unit
+	case "ssh":
+		if t.Inner != nil {
+			return "ssh:" + t.Host + "/" + describeTarget(t.Inner)
+		}
+		return "ssh:" + t.Host
+	}
+	return t.Type
+}
+
+// handleKinds returns the fault catalogue so clients can build forms and
+// help text without hardcoding kinds.
+func (s *Server) handleKinds(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, scenario.Catalog())
+}
+
+// handleFaultRemove removes one named fault from a node: a registry fault
+// by name, "partition"/"crash" flags, or an outstanding node-level fault.
+func (s *Server) handleFaultRemove(w http.ResponseWriter, r *http.Request) {
+	node := chi.URLParam(r, "node")
+	name := chi.URLParam(r, "name")
+	removed, err := s.engine.RemoveFault(node, name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if !removed {
+		http.Error(w, "no fault "+name+" on "+node, http.StatusNotFound)
+		return
+	}
+	if p, ok := s.proxies[node]; ok {
+		writeJSON(w, http.StatusOK, p.Status())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed", "fault": name})
 }
 
 // faultRequest is the body of POST /nodes/{node}/fault. It is a

@@ -30,29 +30,51 @@ type Engine struct {
 	cfg     *config.Config // may be nil: node-level faults then unavailable
 
 	mu       sync.Mutex
-	injected []injectedNodeFault // outstanding node faults needing Revert on heal
+	drivers  map[string]faults.NodeDriver // node name -> resolved driver, built lazily
+	injected []injectedNodeFault          // outstanding node faults needing Revert on heal
 }
 
 type injectedNodeFault struct {
 	fault  faults.NodeFault
-	nodeID string
+	node   string // config node name
+	driver faults.NodeDriver
 }
 
 // New creates an Engine over the given proxies. cfg supplies container IDs
 // for node-level faults; pass nil when only proxy-level faults are needed.
 func New(proxies map[string]*proxy.Proxy, cfg *config.Config) *Engine {
-	return &Engine{Proxies: proxies, cfg: cfg}
+	return &Engine{Proxies: proxies, cfg: cfg, drivers: map[string]faults.NodeDriver{}}
 }
 
-// Kinds lists every fault kind Apply understands, for help text.
-func Kinds() []string {
-	return []string{
-		"latency", "drop", "partition", "crash", "heal",
-		"bandwidth_throttle", "bursty_loss", "reorder", "duplication", "asymmetric_partition", "tcp_rst",
-		"dns_failure",
-		"replica_lag", "wal_delay", "wal_corruption", "query_corruption", "stale_read",
-		"node_crash", "clock_skew", "cpu_throttle", "oom", "zombie",
+// driverFor resolves (and caches) the NodeDriver for a config node from
+// its target block.
+func (e *Engine) driverFor(n *config.Node) (faults.NodeDriver, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if d, ok := e.drivers[n.Name]; ok {
+		return d, nil
 	}
+	if n.Target == nil {
+		return nil, fmt.Errorf("node %q has no target: node-level faults need target: {type: process|docker|systemd|ssh, ...}", n.Name)
+	}
+	d, err := faults.NewDriver(toSpec(n.Target))
+	if err != nil {
+		return nil, fmt.Errorf("node %q: %w", n.Name, err)
+	}
+	e.drivers[n.Name] = d
+	return d, nil
+}
+
+func toSpec(t *config.NodeTarget) faults.TargetSpec {
+	spec := faults.TargetSpec{
+		Type: t.Type, PID: t.PID, PIDFile: t.PIDFile, StartCommand: t.StartCommand,
+		Container: t.Container, Network: t.Network, Unit: t.Unit, Host: t.Host,
+	}
+	if t.Inner != nil {
+		inner := toSpec(t.Inner)
+		spec.Inner = &inner
+	}
+	return spec
 }
 
 // Run executes a scenario's steps in order, honoring each step's AfterMs
@@ -110,7 +132,7 @@ func (e *Engine) Apply(ctx context.Context, step config.FaultStep) error {
 			log.Printf("[%s] healing node", p.Name)
 			p.State.Heal()
 		}
-		e.revertNodeFaults(ctx, func(nodeID string) bool { return e.ownsNode(step, nodeID) })
+		e.revertNodeFaults(ctx, func(node string) bool { return e.ownsNode(step, node) })
 
 	// --- connection-level faults -------------------------------------
 	case "latency":
@@ -246,6 +268,63 @@ func (e *Engine) Apply(ctx context.Context, step config.FaultStep) error {
 	return nil
 }
 
+// RemoveFault removes one named fault from a node (or every node for
+// "*"): a registry fault by its name, or the partition/crash flag by
+// "partition"/"crash". It reports whether anything was removed.
+func (e *Engine) RemoveFault(node, name string) (bool, error) {
+	targets, err := e.targets(config.FaultStep{Node: node})
+	if err != nil {
+		return false, err
+	}
+	removed := false
+	for _, p := range targets {
+		switch name {
+		case "partition":
+			if p.Status().Partitioned {
+				p.State.SetPartitioned(false)
+				removed = true
+			}
+		case "crash":
+			if p.Status().Crashed {
+				p.State.SetCrashed(false)
+				removed = true
+			}
+		default:
+			if p.Registry.Unregister(name) {
+				removed = true
+			}
+		}
+	}
+	// A node-level fault of that name is reverted too.
+	e.mu.Lock()
+	var matched bool
+	for _, inj := range e.injected {
+		if inj.fault.Name() == name && (node == "*" || inj.node == node) {
+			matched = true
+		}
+	}
+	e.mu.Unlock()
+	if matched {
+		e.revertNodeFaults(context.Background(), func(n string) bool {
+			return node == "*" || n == node
+		})
+		removed = true
+	}
+	return removed, nil
+}
+
+// Outstanding returns the node-level faults currently injected, keyed by
+// node name, for status output.
+func (e *Engine) Outstanding() map[string][]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := map[string][]string{}
+	for _, inj := range e.injected {
+		out[inj.node] = append(out[inj.node], inj.fault.Name())
+	}
+	return out
+}
+
 // HealAll clears fault state on every proxy and reverts every outstanding
 // node-level fault, restoring normal operation.
 func (e *Engine) HealAll() {
@@ -305,12 +384,13 @@ func (e *Engine) expireState(step config.FaultStep, p *proxy.Proxy, undo func())
 	}
 }
 
-// runNodeFault injects nf against the step's node container now and
-// schedules Revert after for_ms. The revert uses its own context so a
-// finished scenario cannot strand a container in the faulted state.
+// runNodeFault injects nf against the step's node(s) now and schedules
+// Revert after for_ms. Each node's mechanism comes from its config target
+// (process, docker, systemd, ssh). The revert uses its own context so a
+// finished scenario cannot strand a node in the faulted state.
 func (e *Engine) runNodeFault(ctx context.Context, step config.FaultStep, nf faults.NodeFault) error {
 	if e.cfg == nil {
-		return fmt.Errorf("fault %s: node-level faults need a config with container_id", step.Kind)
+		return fmt.Errorf("fault %s: node-level faults need a config with node targets", step.Kind)
 	}
 	var nodes []*config.Node
 	if step.Node == "*" {
@@ -323,20 +403,21 @@ func (e *Engine) runNodeFault(ctx context.Context, step config.FaultStep, nf fau
 		return fmt.Errorf("fault %s: unknown node %q", step.Kind, step.Node)
 	}
 	for _, n := range nodes {
-		if n.ContainerID == "" {
-			return fmt.Errorf("fault %s: node %q has no container_id", step.Kind, n.Name)
+		d, err := e.driverFor(n)
+		if err != nil {
+			return fmt.Errorf("fault %s: %w", step.Kind, err)
 		}
-		log.Printf("[%s] injecting node fault %s on container %s", n.Name, nf.Name(), n.ContainerID)
-		if err := nf.Inject(ctx, n.ContainerID); err != nil {
+		log.Printf("[%s] injecting node fault %s via %s", n.Name, nf.Name(), d.Describe())
+		if err := nf.Inject(ctx, d); err != nil {
 			return err
 		}
 		e.mu.Lock()
-		e.injected = append(e.injected, injectedNodeFault{fault: nf, nodeID: n.ContainerID})
+		e.injected = append(e.injected, injectedNodeFault{fault: nf, node: n.Name, driver: d})
 		e.mu.Unlock()
-		if d := step.For(); d > 0 {
-			id := n.ContainerID
-			time.AfterFunc(d, func() {
-				e.revertNodeFaults(context.Background(), func(nodeID string) bool { return nodeID == id })
+		if dur := step.For(); dur > 0 {
+			name := n.Name
+			time.AfterFunc(dur, func() {
+				e.revertNodeFaults(context.Background(), func(node string) bool { return node == name })
 			})
 		}
 	}
@@ -344,12 +425,12 @@ func (e *Engine) runNodeFault(ctx context.Context, step config.FaultStep, nf fau
 }
 
 // revertNodeFaults reverts (and forgets) every outstanding node fault whose
-// container matches.
-func (e *Engine) revertNodeFaults(ctx context.Context, match func(nodeID string) bool) {
+// node name matches.
+func (e *Engine) revertNodeFaults(ctx context.Context, match func(node string) bool) {
 	e.mu.Lock()
 	var keep, revert []injectedNodeFault
 	for _, inj := range e.injected {
-		if match(inj.nodeID) {
+		if match(inj.node) {
 			revert = append(revert, inj)
 		} else {
 			keep = append(keep, inj)
@@ -359,20 +440,16 @@ func (e *Engine) revertNodeFaults(ctx context.Context, match func(nodeID string)
 	e.mu.Unlock()
 	for _, inj := range revert {
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if err := inj.fault.Revert(rctx, inj.nodeID); err != nil {
-			log.Printf("revert %s on %s failed: %v", inj.fault.Name(), inj.nodeID, err)
+		if err := inj.fault.Revert(rctx, inj.driver); err != nil {
+			log.Printf("revert %s on %s (%s) failed: %v", inj.fault.Name(), inj.node, inj.driver.Describe(), err)
 		}
 		cancel()
 	}
 }
 
-// ownsNode reports whether a heal step for step.Node covers the container.
-func (e *Engine) ownsNode(step config.FaultStep, nodeID string) bool {
-	if step.Node == "*" || e.cfg == nil {
-		return true
-	}
-	n := e.cfg.FindNode(step.Node)
-	return n != nil && n.ContainerID == nodeID
+// ownsNode reports whether a heal step for step.Node covers the node.
+func (e *Engine) ownsNode(step config.FaultStep, node string) bool {
+	return step.Node == "*" || step.Node == node
 }
 
 // BuiltinScenarios returns a small library of common failure patterns,

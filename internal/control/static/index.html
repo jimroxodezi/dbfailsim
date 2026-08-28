@@ -10,19 +10,46 @@
   <header>
     <h1>dbfailsim <span class="tag">chaos for data</span></h1>
     <div class="header-actions">
+      <span id="summary" class="summary"></span>
       <button id="heal-all" class="btn btn-heal">Heal all</button>
-      <span id="conn-dot" class="dot"></span>
+      <span id="conn-dot" class="dot" title="control API connection"></span>
     </div>
   </header>
 
   <main>
     <section class="panel" id="nodes-panel">
       <h2>Nodes</h2>
+      <p class="hint">Each card is one proxied node. Chips are the live faults on its registry (click &times; to remove one). Node-level faults act on the process behind the proxy through the node's target.</p>
       <div id="nodes" class="nodes-grid"></div>
+    </section>
+
+    <section class="panel" id="inject-panel">
+      <h2>Inject a fault</h2>
+      <p class="hint">Every kind the engine knows. Parameters come from the server's catalogue with their defaults; leave <em>for</em> empty to keep the fault until healed.</p>
+      <form id="inject-form" class="inject-form">
+        <div class="form-row">
+          <label>Node
+            <select id="inject-node"></select>
+          </label>
+          <label>Kind
+            <select id="inject-kind"></select>
+          </label>
+          <label>For
+            <input id="inject-for" type="text" placeholder="e.g. 10s (optional)" />
+          </label>
+        </div>
+        <div id="inject-desc" class="kind-desc"></div>
+        <div id="inject-params" class="params-grid"></div>
+        <div class="form-row form-actions">
+          <button type="submit" class="btn btn-primary">Inject</button>
+          <span id="inject-result" class="hint"></span>
+        </div>
+      </form>
     </section>
 
     <section class="panel" id="scenarios-panel">
       <h2>Scenarios</h2>
+      <p class="hint">Named, timed fault sequences from <code>config.yaml</code>. Steps fire at their offsets; faults with a <code>for</code> window clear themselves.</p>
       <div id="scenarios" class="scenario-list"></div>
     </section>
 
@@ -34,6 +61,12 @@
         <button id="check-run" class="btn btn-primary">Run check</button>
       </div>
       <div id="check-results"></div>
+    </section>
+
+    <section class="panel" id="catalog-panel">
+      <h2>Fault catalogue</h2>
+      <p class="hint">What each kind does, which layer it acts at, and its parameters. The same data drives the inject form and <code>dbfailsim kinds</code>.</p>
+      <div id="catalog" class="catalog"></div>
     </section>
 
     <section class="panel" id="log-panel">

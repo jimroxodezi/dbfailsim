@@ -5,8 +5,9 @@
 // your application and the real database, so you point your app at the
 // proxy instead of the database directly. dbfailsim can then inject faults
 // on that connection without touching the real database process, and — for
-// nodes that declare a container_id — act on the node itself (kill, pause,
-// throttle) through docker.
+// nodes that declare a target — act on the node itself (kill, freeze,
+// throttle) through the matching driver: a local process, a systemd unit,
+// a docker container, or any of those over ssh.
 //
 // Scenarios are named, timed sequences of FaultSteps. A FaultStep names a
 // node, a fault kind, an offset, an optional duration, and kind-specific
@@ -45,10 +46,11 @@ type Node struct {
 	//   "psql postgres://user:pass@127.0.0.1:5432/mydb -t -c \"{query}\""
 	CheckCommand string `yaml:"check_command,omitempty" json:"check_command,omitempty"`
 
-	// ContainerID names this node's container (docker name or ID) for
-	// node-level faults such as node_crash, zombie, cpu_throttle. Empty
-	// means node-level faults are unavailable for this node.
-	ContainerID string `yaml:"container_id,omitempty" json:"container_id,omitempty"`
+	// Target says how to reach this node's process for node-level faults
+	// (node_crash, zombie, cpu_throttle, oom, clock_skew). Nil means the
+	// node is only reachable through its proxy — a managed service, for
+	// example — and node-level faults are unavailable for it.
+	Target *NodeTarget `yaml:"target,omitempty" json:"target,omitempty"`
 
 	// Role is a free-form label ("primary", "replica", "voter") surfaced
 	// to topology-aware faults and the dashboard. Optional.
@@ -58,6 +60,69 @@ type Node struct {
 	// or "replication". Packet-level faults such as replica_lag and
 	// wal_delay only act on a replication-stream proxy.
 	Stream string `yaml:"stream,omitempty" json:"stream,omitempty"`
+}
+
+// NodeTarget describes the deployment behind a node so faults can act on
+// the process itself. Exactly one backend is selected by Type:
+//
+//	target: {type: process, pid_file: /var/run/postgresql/16-main.pid, start_command: "pg_ctlcluster 16 main start"}
+//	target: {type: systemd, unit: postgresql}
+//	target: {type: docker, container: dbfailsim-primary, network: docker_default}
+//	target: {type: ssh, host: db2.internal, inner: {type: systemd, unit: postgresql}}
+//
+// Not every fault is possible on every backend: a bare process cannot be
+// CPU- or memory-limited (use systemd or docker), and a process without
+// start_command cannot be restarted after node_crash. The engine reports
+// those as errors rather than pretending.
+type NodeTarget struct {
+	Type string `yaml:"type" json:"type"` // process | docker | systemd | ssh
+
+	// process
+	PID          int    `yaml:"pid,omitempty" json:"pid,omitempty"`
+	PIDFile      string `yaml:"pid_file,omitempty" json:"pid_file,omitempty"`
+	StartCommand string `yaml:"start_command,omitempty" json:"start_command,omitempty"`
+
+	// docker
+	Container string `yaml:"container,omitempty" json:"container,omitempty"`
+	Network   string `yaml:"network,omitempty" json:"network,omitempty"`
+
+	// systemd
+	Unit string `yaml:"unit,omitempty" json:"unit,omitempty"`
+
+	// ssh: run the inner target's commands on Host via the local ssh client
+	Host  string      `yaml:"host,omitempty" json:"host,omitempty"`
+	Inner *NodeTarget `yaml:"inner,omitempty" json:"inner,omitempty"`
+}
+
+// Validate checks that the selected backend has what it needs.
+func (t *NodeTarget) Validate() error {
+	switch t.Type {
+	case "process":
+		if t.PID <= 0 && t.PIDFile == "" {
+			return fmt.Errorf("target process: need pid or pid_file")
+		}
+	case "docker":
+		if t.Container == "" {
+			return fmt.Errorf("target docker: need container")
+		}
+	case "systemd":
+		if t.Unit == "" {
+			return fmt.Errorf("target systemd: need unit")
+		}
+	case "ssh":
+		if t.Host == "" || t.Inner == nil {
+			return fmt.Errorf("target ssh: need host and inner")
+		}
+		if t.Inner.Type == "ssh" {
+			return fmt.Errorf("target ssh: inner target cannot be ssh")
+		}
+		return t.Inner.Validate()
+	case "":
+		return fmt.Errorf("target: type is required (process|docker|systemd|ssh)")
+	default:
+		return fmt.Errorf("target: unknown type %q (want process|docker|systemd|ssh)", t.Type)
+	}
+	return nil
 }
 
 // IsReplicationStream reports whether the node's proxy carries replication traffic.
@@ -245,6 +310,11 @@ func (c *Config) Validate() error {
 		case "", "query", "replication":
 		default:
 			return fmt.Errorf("config: node %q has unknown stream %q (want query|replication)", n.Name, n.Stream)
+		}
+		if n.Target != nil {
+			if err := n.Target.Validate(); err != nil {
+				return fmt.Errorf("config: node %q: %w", n.Name, err)
+			}
 		}
 	}
 	for _, sc := range c.Scenarios {

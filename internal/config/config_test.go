@@ -62,10 +62,10 @@ func TestLoadRejectsEmptyNodes(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsBadJSON(t *testing.T) {
-	path := writeConfig(t, `{not json`)
+func TestLoadRejectsMalformedYAML(t *testing.T) {
+	path := writeConfig(t, "nodes:\n  - name: a\n   listen_addr: bad indent\n")
 	if _, err := Load(path); err == nil {
-		t.Fatal("want error for malformed JSON")
+		t.Fatal("want error for malformed YAML")
 	}
 }
 
@@ -97,7 +97,11 @@ func TestFindNodeAndScenario(t *testing.T) {
 func TestLoadNodeExtrasAndValidation(t *testing.T) {
 	path := writeConfig(t, `
 nodes:
-  - {name: primary, listen_addr: a, upstream_addr: b, container_id: dbfailsim-primary, role: primary}
+  - name: primary
+    listen_addr: a
+    upstream_addr: b
+    role: primary
+    target: {type: ssh, host: db1, inner: {type: docker, container: dbfailsim-primary, network: dbnet}}
   - {name: primary-repl, listen_addr: c, upstream_addr: d, stream: replication}
 scenarios:
   - name: s
@@ -111,8 +115,13 @@ scenarios:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Nodes[0].ContainerID != "dbfailsim-primary" || cfg.Nodes[0].Role != "primary" {
-		t.Errorf("node extras not parsed: %+v", cfg.Nodes[0])
+	tgt := cfg.Nodes[0].Target
+	if cfg.Nodes[0].Role != "primary" || tgt == nil || tgt.Type != "ssh" || tgt.Host != "db1" ||
+		tgt.Inner == nil || tgt.Inner.Type != "docker" || tgt.Inner.Container != "dbfailsim-primary" || tgt.Inner.Network != "dbnet" {
+		t.Errorf("node target not parsed: %+v", cfg.Nodes[0])
+	}
+	if cfg.Nodes[1].Target != nil {
+		t.Error("node without target should have nil Target")
 	}
 	if !cfg.Nodes[1].IsReplicationStream() || cfg.Nodes[0].IsReplicationStream() {
 		t.Error("stream classification wrong")
@@ -131,6 +140,10 @@ scenarios:
 		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y}\nscenarios:\n  - name: s\n    steps: [{node: ghost, kind: crash}]\n",
 		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y}\nscenarios:\n  - name: s\n    steps: [{node: a}]\n",
 		"nodes: [\n",
+		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y, target: {type: docker}}\n",
+		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y, target: {type: process}}\n",
+		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y, target: {type: lxc, container: c}}\n",
+		"nodes:\n  - {name: a, listen_addr: x, upstream_addr: y, target: {type: ssh, host: h, inner: {type: ssh, host: h2}}}\n",
 	} {
 		if _, err := Load(writeConfig(t, bad)); err == nil {
 			t.Errorf("Load accepted invalid config: %s", bad)

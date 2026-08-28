@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jimroxodezi/dbfailsim/internal/config"
+	"github.com/jimroxodezi/dbfailsim/internal/faults"
 	"github.com/jimroxodezi/dbfailsim/internal/proxy"
 	"github.com/jimroxodezi/dbfailsim/internal/scenario"
 )
@@ -225,5 +227,118 @@ func TestFaultEndpointGeneralForm(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown kind status = %d", resp2.StatusCode)
+	}
+}
+
+func TestKindsEndpointMatchesEngineCatalog(t *testing.T) {
+	h, _ := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/kinds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []scenario.KindInfo
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(scenario.Kinds()) {
+		t.Fatalf("/kinds returned %d kinds, catalogue has %d", len(got), len(scenario.Kinds()))
+	}
+	// Every kind the engine accepts must be documented, and vice versa.
+	for _, k := range got {
+		if resp2, err := http.Post(srv.URL+"/nodes/n1/fault", "application/json", strings.NewReader(`{"kind":"`+k.Kind+`"}`)); err == nil {
+			body, _ := io.ReadAll(resp2.Body)
+			resp2.Body.Close()
+			if resp2.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "unknown fault kind") {
+				t.Errorf("catalogued kind %q is unknown to the engine", k.Kind)
+			}
+		}
+	}
+	http.Post(srv.URL+"/heal", "application/json", nil)
+}
+
+func TestStatusIncludesNodeMetadataAndFaultList(t *testing.T) {
+	cfg := &config.Config{
+		Nodes: []config.Node{{
+			Name: "n1", ListenAddr: "127.0.0.1:0", UpstreamAddr: "127.0.0.1:1", Role: "primary", Stream: "replication",
+			Target: &config.NodeTarget{Type: "ssh", Host: "db1", Inner: &config.NodeTarget{Type: "systemd", Unit: "postgresql"}},
+		}},
+	}
+	proxies := map[string]*proxy.Proxy{"n1": proxy.New("n1", "127.0.0.1:0", "127.0.0.1:1")}
+	proxies["n1"].Stream = faults.ReplicationStream // as cmdServe does from cfg
+	h, err := NewServer(cfg, proxies, scenario.New(proxies, cfg)).Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	if r, err := http.Post(srv.URL+"/nodes/n1/fault", "application/json", strings.NewReader(`{"kind":"reorder"}`)); err == nil {
+		r.Body.Close()
+	}
+	resp, err := http.Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var st []NodeStatus
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st) != 1 || st[0].Role != "primary" || st[0].Target != "ssh:db1/systemd:postgresql" || st[0].Stream != "replication" {
+		t.Fatalf("status = %+v", st)
+	}
+	if len(st[0].ActiveFaults) != 1 || st[0].ActiveFaults[0] != "reorder" || st[0].NodeFaults == nil {
+		t.Fatalf("faults = %+v", st[0])
+	}
+}
+
+func TestRemoveFaultEndpoint(t *testing.T) {
+	h, proxies := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	client := &http.Client{}
+	post := func(body string) {
+		r, err := http.Post(srv.URL+"/nodes/n1/fault", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+	}
+	del := func(name string) int {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/nodes/n1/faults/"+name, nil)
+		r, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	post(`{"kind":"latency","latency_ms":100}`)
+	post(`{"kind":"reorder"}`)
+	post(`{"kind":"partition"}`)
+	if code := del("reorder"); code != http.StatusOK {
+		t.Fatalf("delete reorder = %d", code)
+	}
+	if code := del("partition"); code != http.StatusOK {
+		t.Fatalf("delete partition = %d", code)
+	}
+	st := proxies["n1"].Status()
+	if st.Partitioned || len(st.ActiveFaults) != 1 || st.ActiveFaults[0] != "latency" {
+		t.Fatalf("after removes: %+v", st)
+	}
+	if code := del("reorder"); code != http.StatusNotFound {
+		t.Fatalf("delete absent fault = %d, want 404", code)
+	}
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/nodes/ghost/faults/latency", nil)
+	r, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown node = %d", r.StatusCode)
 	}
 }

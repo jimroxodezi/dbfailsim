@@ -20,13 +20,33 @@ upstream — it's protocol-agnostic, so it works with Postgres, MySQL, or
 anything else over TCP. When you inject a fault, it's applied to that
 byte stream in real time:
 
-- **latency** — added delay on every packet, simulating slow replication or network jitter
-- **drop** — a percentage of packets silently discarded, simulating packet loss / a replica that never catches up
-- **partition** — the node stops accepting connections and severs existing ones, simulating a network split
-- **crash** — same effect as partition, reported separately for clarity
+- **wire faults** on a connection — `latency` (fixed, jittered, or ramping),
+  `drop`, `bursty_loss`, `bandwidth_throttle`, `reorder`, `duplication`,
+  `tcp_rst`, `asymmetric_partition` (one direction only)
+- **reachability** — `partition` (refuse new connections, sever existing
+  ones) and `crash` (same effect, reported separately)
+- **dial faults** — `dns_failure` fails the upstream dial itself
+- **packet faults**, gated by the proxy's stream type — `replica_lag`,
+  `wal_delay`, `wal_corruption` on a replication proxy; `query_corruption`
+  on a query proxy; `stale_read` serves a cached older response
+- **node faults** on nodes with a `target` — `node_crash` (SIGKILL/SIGTERM),
+  `zombie` (freeze), `cpu_throttle`, `oom`, `clock_skew`. The fault says
+  *what*; the node's target says *how*: a local process (pid / pid file),
+  a systemd unit, a docker container, or any of those on another host over
+  ssh. A node without a target (a managed database) only gets proxy-level
+  faults, and the engine says so instead of guessing.
+
+The fault model is larger than what the engine can trigger today: the
+`faults` package also defines topology faults (group partition, split
+brain, quorum loss, election storm), stored-data faults (log divergence,
+row corruption), workload faults (pool exhaustion, deadlock, lock
+contention, mid-transaction failover) and client-visible consistency
+faults (read-your-writes, monotonic reads). Those have implementations and
+interfaces but no scenario-engine case yet — see "What's implemented".
 
 A **scenario** is a named, timed sequence of these faults, so "split-brain"
-or "replica-lag" is one command instead of manual toggling.
+or "replica-lag" is one command instead of manual toggling. Every step can
+carry a `for_ms` window after which the engine removes the fault again.
 
 The **consistency check** (`dbfailsim check`) is the payoff: it runs the
 same read against every node directly (bypassing the proxy, so it reflects
@@ -36,8 +56,12 @@ visible proof of what your chaos experiment actually did to your data.
 ## Architecture
 
 One `dbfailsim serve` process runs a fault-injecting TCP proxy per
-configured node plus the HTTP control plane. The CLI's `inject` / `fault` /
-`heal` / `status` subcommands are thin HTTP clients against that control
+configured node plus the HTTP control plane. Each proxy owns a **fault
+registry** — the live set of connection, dial, packet and read-hook faults
+for that node — and a small **state** for partition/crash. A single
+**scenario engine** turns every fault step (from a scenario or from the
+API) into a registry, state or docker action. The CLI's `inject` / `fault`
+/ `heal` / `status` subcommands are thin HTTP clients against the control
 API — the same API the dashboard and your CI scripts use. `check` is the
 exception: it bypasses the proxies entirely and shells out to a real
 database client against each node, so it reports true database state.
@@ -83,12 +107,16 @@ Package layout:
 | Package | Role |
 |---|---|
 | `cmd/dbfailsim` | CLI entry point; subcommands are HTTP clients of the control API |
-| `internal/proxy` | Protocol-agnostic TCP proxy; applies latency/drop per chunk, severs connections on partition/crash |
-| `internal/faults` | The fault model: connection, dial, packet, node, topology, data, workload and consistency fault types |
+| `internal/proxy` | Protocol-agnostic TCP proxy; per-node fault `Registry` (conn/dial/packet/read-hook faults, live re-wrap of open connections), `State` for partition/crash, optional `ClusterView` gating for inter-node proxies |
+| `internal/faults` | The fault model: connection, dial, packet, node, topology, data, workload and consistency fault types; `NodeDriver` backends (process, systemd, docker, ssh) that node faults act through |
 | `internal/scenario` | The single fault engine: turns a `config.FaultStep` into registry/state/docker actions; runs timed scenarios |
 | `internal/control` | chi-routed HTTP API + embedded web dashboard (routes faults through the same engine) |
 | `internal/check` | Cross-node consistency check via each node's `check_command` |
-| `internal/config` | The single YAML schema: nodes (incl. `container_id`, `role`, `stream`), scenarios, control address |
+| `internal/config` | The single YAML schema: nodes (incl. `target`, `role`, `stream`), scenarios, control address |
+| `internal/raft` | Raft leader election (terms, roles, randomized timeouts, `RequestVote`, heartbeats) as a pure `Tick`/`Step` state machine plus an in-memory simulated cluster with partitions — not yet wired to the proxies |
+
+A 300-page walkthrough of the codebase, its fault model and the roadmap is
+in `dbfailsim-walkthrough.pdf` at the repository root.
 
 ## Quick start
 
@@ -121,6 +149,8 @@ cp config.example.yaml config.yaml
 # One-off fault instead of a full scenario
 ./dbfailsim fault --config config.yaml --node replica-1 --kind latency --value 2000
 ./dbfailsim fault --config config.yaml --node replica-1 --kind reorder --params '{"buffer_size":5}' --for 5000
+./dbfailsim fault --config config.yaml --node replica-1 --kind reorder --remove   # remove one fault
+./dbfailsim kinds                                                                  # the fault catalogue
 
 # Recover
 ./dbfailsim heal --config config.yaml
@@ -138,9 +168,20 @@ See `config.example.yaml`. Each node needs:
   "plug into your DB infra" without needing a driver for every database —
   it shells out to whatever client you already have installed (`psql`,
   `mysql`, `redis-cli`, etc.).
-- `container_id` (optional) — the docker container name/ID for this node.
-  Required for node-level faults (`node_crash`, `zombie`, `cpu_throttle`,
-  `oom`, `clock_skew`).
+- `target` (optional) — how node-level faults reach this node's process.
+  Required for `node_crash`, `zombie`, `cpu_throttle`, `oom`, `clock_skew`;
+  omit it for a managed database. One of:
+  - `{type: process, pid: 1234}` or `{type: process, pid_file: /run/pg.pid, start_command: "pg_ctl start"}`
+    — signals and freeze work; `node_crash` can only be reverted with a
+    `start_command`; CPU/memory limits are unsupported (a bare process has
+    no cgroup of its own).
+  - `{type: systemd, unit: postgresql}` — everything, via `systemctl kill`
+    / `start` / `set-property --runtime`.
+  - `{type: docker, container: dbfailsim-primary, network: docker_default}`
+    — everything, via the docker CLI; `network` is used by quorum-loss
+    isolation.
+  - `{type: ssh, host: user@db2.internal, inner: {...}}` — runs the inner
+    target's commands on another host through your local `ssh`.
 - `role` (optional) — a free-form label (`primary`, `replica`, `voter`).
 - `stream` (optional) — `query` (default) or `replication`. Packet-level
   faults (`replica_lag`, `wal_delay`, `wal_corruption`) only act on a
@@ -174,14 +215,23 @@ Kinds: `latency`, `drop`, `partition`, `crash`, `heal`, `bandwidth_throttle`,
 faults can be triggered from CI, a test harness, a curl script, or the
 built-in dashboard:
 
-- `GET  /status` — current fault state of every node
+- `GET  /status` — every node: proxy state (`partitioned`, `crashed`,
+  `active_faults`, `active_clients`, `stream`) plus `role`, `target`
+  (e.g. `docker:dbfailsim-primary`, empty for proxy-only nodes) and
+  `node_faults` currently injected on the process
+- `GET  /kinds` — the fault catalogue: every kind with its class, description,
+  parameters, defaults, and whether it needs a target or a specific stream.
+  The dashboard's inject form and `dbfailsim kinds` are built from it.
 - `GET  /scenarios` — the named scenarios defined in your config
 - `GET  /check?query=<query>` — run the consistency check and return JSON
 - `POST /nodes/{node}/fault` — apply one fault, same shape as a scenario step
   minus the node: `{"kind":"latency","latency_ms":2000}` or
-  `{"kind":"reorder","params":{"buffer_size":5},"for_ms":5000}`
+  `{"kind":"reorder","params":{"buffer_size":5},"for_ms":5000}`. `{node}`
+  may be `*`.
+- `DELETE /nodes/{node}/faults/{name}` — remove one fault: a registry fault
+  by name, `partition`/`crash`, or an injected node-level fault (reverted)
 - `POST /scenarios/{name}/run` — run a named scenario from the config
-- `POST /heal` — clear all fault state
+- `POST /heal` — clear all fault state and revert every node-level fault
 
 Routing is [chi](https://github.com/go-chi/chi) with request logging and
 panic recovery middleware; wrong-method requests get a proper `405`.
@@ -197,11 +247,21 @@ localhost that way, since the API can sever connections and `/check` runs
 shell commands from your config.
 
 Open `http://<control_addr>/` (e.g. `http://127.0.0.1:8080/`) in a browser
-for a live dashboard: per-node status cards with one-click fault buttons
-(latency, drop, partition, crash, heal), a scenario runner, a consistency-
-check panel, and an activity log. It polls `/status` every 1.5s, so you can
-watch a scenario unfold in real time. No build step — it's plain HTML/CSS/JS
-embedded directly into the `dbfailsim` binary via `go:embed`.
+for a live dashboard:
+
+- **Node cards** — role, stream, target, reachability, and a chip for every
+  live fault (registry faults, partition/crash, node-level faults) with a
+  one-click remove; quick buttons for latency, drop, RST, partition, crash,
+  and — on nodes with a target — kill and zombie.
+- **Inject form** — pick a node (or `*`), any kind from the catalogue, its
+  parameters pre-filled with defaults, and an optional `for` window.
+- **Scenarios** — each with its step list, one-click run.
+- **Consistency check**, the **fault catalogue** as reference, and an
+  **activity log**.
+
+It polls `/status` every 1.5s, so you can watch a scenario unfold in real
+time. No build step — plain HTML/CSS/JS embedded into the binary via
+`go:embed`.
 
 ## Docker Compose demo (real Postgres, not a mock)
 
@@ -234,23 +294,73 @@ Try it end to end:
 5. Click "Heal all" to recover
 
 This harness has been run and verified end to end: primary init, replica
-clone via `pg_basebackup`, live WAL streaming, all four fault kinds through
-the proxies, scenario execution, forced-divergence detection via `/check`,
-and heal recovery. See TEST.md §3a for the full walkthrough and a
-deterministic way to make the consistency check show divergence.
+clone via `pg_basebackup`, live WAL streaming, the original four fault
+kinds through the proxies, scenario execution, forced-divergence detection
+via `/check`, and heal recovery. See TEST.md §3a for the full walkthrough
+and a deterministic way to make the consistency check show divergence.
+
+Two caveats for the newer fault kinds in this harness:
+
+- The harness nodes declare `target: {type: docker, ...}`, so node faults
+  run the docker CLI from the process running `serve`. The `dbfailsim`
+  container has no docker CLI or socket, so the `flaky-replica` scenario's
+  `node_crash` step fails there; run `serve` on the host (with
+  `docker/config.docker.yaml` adapted to `localhost` addresses) or mount the
+  docker socket and CLI into the container.
+- Packet faults on the replication stream have nothing to act on yet,
+  because WAL flows between the Postgres containers directly (Phase 0 of
+  the roadmap adds the replication-path proxy).
 
 ## What's implemented vs. what's next
 
-**Working now, tested end-to-end against a live TCP backend:**
-protocol-agnostic fault-injecting proxy (latency, drop, partition, crash),
-named/timed scenarios, HTTP control API, the shell-out consistency checker,
-and the web dashboard. Every package has a test suite (`go test ./...`,
-race-detector clean), including proxy integration tests against a real TCP
-upstream and HTTP tests for every API endpoint.
+**Working now, tested against a live TCP backend:**
+
+- the protocol-agnostic proxy with a per-node fault registry: connection
+  faults wrap each pump's destination and are re-applied live when the
+  registry changes; dial faults run before the upstream dial; packet
+  faults run per chunk with a cancellable context and the proxy's stream
+  type; read hooks pair replies with the last query; partition/crash
+  sever connections and cancel in-flight fault sleeps
+- the `faults` package: eight interface families (connection, time-varying,
+  dial, packet, node, topology, data, workload, consistency) and ~30
+  concrete fault types
+- one YAML config and one scenario engine: short-form steps (`latency_ms`,
+  `drop_percent`) and general-form steps (`kind` + `params` + `for_ms`),
+  `"*"` targeting, automatic expiry, node faults via docker with tracked
+  revert on heal
+- HTTP control API (routing one-off faults through the same engine; per-node
+  status with role/target/stream and node faults; the fault catalogue at
+  `/kinds`; per-fault removal), the CLI (`fault --params/--for/--remove`,
+  `kinds`), the shell-out consistency checker, and a dashboard that exposes
+  every kind through a catalogue-driven inject form
+- the Docker harness: real Postgres primary + streaming replica
+- `internal/raft`: the election half of Raft as a deterministic state
+  machine, with a simulated network and tests for the safety property and
+  each partition demo (leader isolation, no-majority stall, minority side,
+  one-way link, deposed leader steps down)
+
+Every package has a test suite (`go test -race ./...`, race-detector
+clean): proxy and registry integration tests against real TCP, HTTP tests
+for every endpoint, engine tests over live proxies.
+
+**Known gaps, in rough priority order:**
+
+- In the Docker harness the WAL stream still bypasses the proxies, so
+  `replica_lag`/`wal_delay` have nothing real to act on until a
+  replication-path proxy exists (Phase 0). The `stream: replication` config
+  and `Proxy.Stream` wiring are in place.
+- Topology, data, workload and consistency faults have no engine case
+  (they need a `ClusterView`, `DataStore` or `DBSession` on the engine).
+  `CrashLoopFault`, `DiskFullFault` and `DiskIOLatencyFault` exist but
+  are not reachable from a scenario either.
+- Raft has no transport: participants are not yet embedded in `serve` or
+  routed over proxied links, so injected faults cannot reach an election.
+- `ReorderFault` holds buffered chunks until the buffer fills and does not
+  flush on close; `StaleReadFault` retains the slice it is given.
 
 **What's next:** see the [Roadmap](#roadmap) below — a staged plan to grow
 this from a chaos injector into a working tour of distributed-systems
-theory.
+theory. Items already delivered are ticked in their milestone lists.
 
 ## Roadmap
 
@@ -271,13 +381,16 @@ everything else rests on.
 
 Small infrastructure pieces that later phases depend on:
 
-- **Per-direction (asymmetric) faults.** Today a fault applies to both pump
-  directions of a connection. Real network failures are often asymmetric —
-  A can reach B but not vice versa — and one-way partitions are what make
-  split-brain and failure-detector scenarios genuinely interesting. Extend
-  `proxy.State` so latency/drop/partition can be set for
-  client→upstream and upstream→client independently
-  (`{"kind":"partition","direction":"inbound"}`).
+- **Per-direction (asymmetric) faults.** *Largely done.* Real network
+  failures are often asymmetric — A can reach B but not vice versa — and
+  one-way partitions are what make split-brain and failure-detector
+  scenarios genuinely interesting. `faults.Direction`,
+  `asymmetric_partition` (`block_direction: inbound|outbound`) and the
+  proxy's per-leg wrapping deliver this. Remaining: a `direction` param on
+  latency/drop/throttle so they can be one-way too, and dashboard controls.
+- **Single schema and engine.** *Done.* One YAML config (`internal/config`)
+  and one `scenario.Engine` whose `Apply` is the path for every fault, from
+  scenarios and from the API alike.
 - **Replication-path proxying.** In the Docker harness the replica streams
   WAL from the primary *directly*, so injected faults never touch
   replication (see TEST.md §3a). Add a third proxy node fronting the
@@ -475,8 +588,8 @@ event timeline.
 - Heal and watch the deposed leader step down on seeing a higher term.
 
 **Milestones**
-- [ ] Raft election state machine (unit-tested with a simulated network,
-      no real sockets)
+- [x] Raft election state machine (unit-tested with a simulated network,
+      no real sockets) — `internal/raft`
 - [ ] Inter-node RPC through dbfailsim-proxied links
 - [ ] Dashboard: role/term/votes per node + election events in the timeline
 - [ ] Scripted demos: leader partition, split vote, no-majority stall,

@@ -2,10 +2,13 @@ package scenario
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jimroxodezi/dbfailsim/internal/config"
+	"github.com/jimroxodezi/dbfailsim/internal/faults"
 	"github.com/jimroxodezi/dbfailsim/internal/proxy"
 )
 
@@ -139,15 +142,31 @@ func TestPartitionForWindowClears(t *testing.T) {
 	}
 }
 
-func TestNodeFaultNeedsContainerID(t *testing.T) {
+func TestNodeFaultNeedsTarget(t *testing.T) {
 	proxies := map[string]*proxy.Proxy{"primary": proxy.New("primary", "127.0.0.1:0", "127.0.0.1:1")}
 	cfg := &config.Config{Nodes: []config.Node{{Name: "primary", ListenAddr: "a", UpstreamAddr: "b"}}}
 	eng := New(proxies, cfg)
-	if err := eng.Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "zombie"}); err == nil {
-		t.Fatal("zombie without container_id should fail")
+	err := eng.Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "zombie"})
+	if err == nil || !strings.Contains(err.Error(), "no target") {
+		t.Fatalf("zombie without target should fail clearly, got %v", err)
 	}
 	if err := New(proxies, nil).Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "node_crash"}); err == nil {
 		t.Fatal("node fault without config should fail")
+	}
+}
+
+// A process target with no start_command cannot be restarted: node_crash
+// must surface ErrUnsupported on revert rather than silently doing nothing.
+func TestNodeFaultUnsupportedOperationIsReported(t *testing.T) {
+	proxies := map[string]*proxy.Proxy{"primary": proxy.New("primary", "127.0.0.1:0", "127.0.0.1:1")}
+	cfg := &config.Config{Nodes: []config.Node{{
+		Name: "primary", ListenAddr: "a", UpstreamAddr: "b",
+		Target: &config.NodeTarget{Type: "process", PID: 1},
+	}}}
+	eng := New(proxies, cfg)
+	err := eng.Apply(context.Background(), config.FaultStep{Node: "primary", Kind: "cpu_throttle"})
+	if !errors.Is(err, faults.ErrUnsupported) {
+		t.Fatalf("cpu_throttle on a bare process should be ErrUnsupported, got %v", err)
 	}
 }
 

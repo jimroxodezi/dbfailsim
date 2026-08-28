@@ -3,8 +3,8 @@ package faults
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -176,11 +176,12 @@ func (f *SplitBrainFault) Revert(ctx context.Context, view ClusterView) error {
 // Quorum loss — isolates enough voters from the cluster network that the
 // remaining voters fall below majority, without a full symmetric
 // partition (the isolated nodes are simply gone, not split into their
-// own functioning group).
+// own functioning group). Isolation goes through each voter's NodeDriver,
+// which must implement NetworkIsolator (the docker driver does).
 type QuorumLossFault struct {
 	VoterNodes   []string
 	NodesToBlock int
-	DockerNetwork string // e.g. "dbfailsim_net"
+	Drivers      map[string]NodeDriver // voter node ID -> its driver
 
 	mu         sync.Mutex
 	blockedSet map[string]bool
@@ -188,24 +189,34 @@ type QuorumLossFault struct {
 
 func (f *QuorumLossFault) Name() string { return "quorum_loss" }
 
+func (f *QuorumLossFault) isolator(nodeID string) (NetworkIsolator, error) {
+	d, ok := f.Drivers[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("quorum loss: no driver for node %s", nodeID)
+	}
+	iso, ok := d.(NetworkIsolator)
+	if !ok {
+		return nil, fmt.Errorf("quorum loss: %s driver cannot isolate from the network: %w", d.Describe(), ErrUnsupported)
+	}
+	return iso, nil
+}
+
 func (f *QuorumLossFault) Inject(ctx context.Context, view ClusterView) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.blockedSet = make(map[string]bool)
-
-	net := f.DockerNetwork
-	if net == "" {
-		net = "dbfailsim_net"
-	}
 
 	blocked := 0
 	for _, v := range f.VoterNodes {
 		if blocked >= f.NodesToBlock {
 			break
 		}
-		cmd := exec.CommandContext(ctx, "docker", "network", "disconnect", net, v)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("quorum loss: failed to isolate %s: %w (%s)", v, err, out)
+		iso, err := f.isolator(v)
+		if err != nil {
+			return err
+		}
+		if err := iso.Isolate(ctx); err != nil {
+			return fmt.Errorf("quorum loss: failed to isolate %s: %w", v, err)
 		}
 		f.blockedSet[v] = true
 		blocked++
@@ -216,14 +227,10 @@ func (f *QuorumLossFault) Inject(ctx context.Context, view ClusterView) error {
 func (f *QuorumLossFault) Revert(ctx context.Context, view ClusterView) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	net := f.DockerNetwork
-	if net == "" {
-		net = "dbfailsim_net"
-	}
 	for v := range f.blockedSet {
-		cmd := exec.CommandContext(ctx, "docker", "network", "connect", net, v)
-		_ = cmd.Run() // best-effort; a node that's still down will fail this harmlessly
+		if iso, err := f.isolator(v); err == nil {
+			_ = iso.Reconnect(ctx) // best-effort; a node that's still down will fail this harmlessly
+		}
 	}
 	f.blockedSet = make(map[string]bool)
 	return nil
@@ -253,6 +260,7 @@ type LeaderElectionStormFault struct {
 	LeaderProbe func(ctx context.Context, view ClusterView) (string, error)
 	Interval    time.Duration
 	Duration    time.Duration
+	Drivers     map[string]NodeDriver // node ID -> driver used to kill the leader
 
 	cancel context.CancelFunc
 }
@@ -289,7 +297,9 @@ func (f *LeaderElectionStormFault) Inject(ctx context.Context, view ClusterView)
 				if err != nil || leader == "" {
 					continue
 				}
-				_ = exec.CommandContext(loopCtx, "docker", "kill", "--signal", "SIGTERM", leader).Run()
+				if d, ok := f.Drivers[leader]; ok {
+					_ = d.Signal(loopCtx, syscall.SIGTERM)
+				}
 			}
 		}
 	}()

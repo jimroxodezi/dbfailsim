@@ -58,8 +58,8 @@ type PoolExhaustionFault struct {
 	HoldConnections int
 	HoldFor         time.Duration
 
-	mu   sync.Mutex
-	txs  []Tx
+	mu  sync.Mutex
+	txs []Tx
 }
 
 func (f *PoolExhaustionFault) Name() string { return "pool_exhaustion" }
@@ -111,8 +111,8 @@ func (f *PoolExhaustionFault) Release() { f.release() }
 // rows in opposite order, reproducing a classic deadlock so the system
 // under test's deadlock detector/retry logic gets exercised.
 type DeadlockFault struct {
-	Table     string
-	KeyColumn string
+	Table      string
+	KeyColumn  string
 	KeyA, KeyB string
 }
 
@@ -168,12 +168,11 @@ func (f *DeadlockFault) Inject(ctx context.Context, session DBSession) error {
 	return nil
 }
 
-
 // Long-running transaction / lock contention — holds a row lock open for
 // a fixed duration so concurrent client writers queue up behind it.
 type LockContentionFault struct {
 	Table, KeyColumn, Key string
-	HoldFor                time.Duration
+	HoldFor               time.Duration
 }
 
 func (f *LockContentionFault) Name() string { return "lock_contention" }
@@ -211,9 +210,9 @@ type Snapshottable interface {
 }
 
 type BackupWindowFault struct {
-	Store    Snapshottable
-	Table    string
-	OpenFor  time.Duration
+	Store   Snapshottable
+	Table   string
+	OpenFor time.Duration
 
 	snapshot [][]any
 }
@@ -246,11 +245,11 @@ func (f *BackupWindowFault) Inject(ctx context.Context, session DBSession) error
 // with an in-flight, uncommitted transaction, so client code exercises
 // its "transaction failed because the primary died mid-commit" path.
 type MidTxFailoverFault struct {
-	Crash       NodeFault // typically &CrashFault{Signal: syscall.SIGKILL}
-	PrimaryNode string
-	Table, Col  string
-	Key         string
-	Value       any
+	Crash            NodeFault  // typically &CrashFault{Signal: syscall.SIGKILL}
+	PrimaryNode      NodeDriver // the primary's driver, resolved from its config target
+	Table, Col       string
+	Key              string
+	Value            any
 	DelayBeforeCrash time.Duration
 }
 

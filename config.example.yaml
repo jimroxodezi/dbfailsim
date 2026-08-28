@@ -7,6 +7,13 @@ nodes:
   role: primary
   listen_addr: 127.0.0.1:6432
   upstream_addr: 127.0.0.1:5432
+  # target: how node-level faults (node_crash, zombie, cpu_throttle, oom,
+  # clock_skew) reach the process. Omit it for a managed database.
+  #   {type: process, pid_file: /var/run/postgresql/16-main.pid, start_command: "pg_ctlcluster 16 main start"}
+  #   {type: systemd, unit: postgresql}
+  #   {type: docker, container: dbfailsim-primary}
+  #   {type: ssh, host: db2.internal, inner: {type: systemd, unit: postgresql}}
+  target: {type: systemd, unit: postgresql}
   check_command: psql "postgresql://dbuser:dbpass@127.0.0.1:5432/appdb" -t -c "{query}"
 - name: replica-1
   listen_addr: 127.0.0.1:6433

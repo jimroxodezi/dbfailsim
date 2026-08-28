@@ -13,6 +13,7 @@
 //	dbfailsim heal     --config config.yaml
 //	dbfailsim status   --config config.yaml
 //	dbfailsim check    --config config.yaml --query "SELECT balance FROM accounts WHERE id=1"
+//	dbfailsim kinds
 package main
 
 import (
@@ -52,6 +53,8 @@ func main() {
 		cmdStatus(os.Args[2:])
 	case "check":
 		cmdCheck(os.Args[2:])
+	case "kinds":
+		cmdKinds(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -71,6 +74,7 @@ Commands:
   heal     Clear all fault state, restoring normal operation
   status   Show current health of every node's proxy
   check    Query every node directly and show whether they agree
+  kinds    List every fault kind with its parameters and defaults
 
 Run 'dbfailsim <command> -h' for command-specific flags.
 `)
@@ -127,10 +131,20 @@ func cmdFault(args []string) {
 	value := fs.Int("value", 0, "latency_ms for kind=latency, drop_percent for kind=drop")
 	params := fs.String("params", "", `kind-specific JSON params, e.g. '{"delay":"500ms","ramp_to":"3s"}'`)
 	forMs := fs.Int("for", 0, "auto-remove the fault after this many milliseconds (0 = until healed)")
+	remove := fs.Bool("remove", false, "remove the named fault from the node instead of applying it")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*configPath)
 	must(err)
+
+	if *remove {
+		resp, err := apiRequest(cfg, http.MethodDelete, fmt.Sprintf("/nodes/%s/faults/%s", url.PathEscape(*node), url.PathEscape(*kind)), nil)
+		must(err)
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		fmt.Printf("%s: %s\n", resp.Status, out)
+		return
+	}
 
 	req := map[string]any{"kind": *kind}
 	switch *kind {
@@ -203,6 +217,28 @@ func cmdCheck(args []string) {
 
 	results := check.Run(cfg, *query)
 	fmt.Print(check.Render(results))
+}
+
+func cmdKinds(args []string) {
+	fs := flag.NewFlagSet("kinds", flag.ExitOnError)
+	fs.Parse(args)
+	for _, k := range scenario.Catalog() {
+		extra := ""
+		if k.Stream != "" {
+			extra += "  [" + k.Stream + " stream]"
+		}
+		if k.NeedsTarget {
+			extra += "  [needs target]"
+		}
+		fmt.Printf("%-22s %-10s %s%s\n", k.Kind, k.Class, k.Description, extra)
+		for _, p := range k.Params {
+			def := ""
+			if p.Default != nil {
+				def = fmt.Sprintf(" (default %v)", p.Default)
+			}
+			fmt.Printf("    %-20s %-9s %s%s\n", p.Name, p.Type, p.Help, def)
+		}
+	}
 }
 
 // apiRequest sends a control API request, attaching the bearer token from
